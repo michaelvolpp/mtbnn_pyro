@@ -16,45 +16,64 @@ from pyro.optim import Adam
 
 
 def check_shapes(x, y):
-    assert x.ndim == 3  # (n_task, n_points, d_x)
+    assert x.ndim == 3  # (n_points, n_tasks, d_x)
     assert x.shape[-1] == 1  # d_x = 1
     if y is not None:
         assert x.shape == y.shape  # d_y = 1
 
 
-def mtblr_model(x, y=None):
+def mtblr_model(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
     check_shapes(x=x, y=y)
+    n_points = x.shape[0]
+    n_tasks = x.shape[1]
+    d_x = x.shape[2]
+    if y is not None:
+        assert y.shape == (n_points, n_tasks, d_y)
 
-    m_loc = pyro.param("m_loc_prior", torch.tensor(0.0))
+    m_loc_prior = pyro.param("m_loc_prior", torch.tensor(0.0))
     m_scale_prior = pyro.param(
-        "m_scale_prior", torch.tensor(1.0), constraint=constraints.positive
+        "m_scale_prior",
+        torch.tensor(1.0),
+        constraint=constraints.positive,
     )
     sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
-    with pyro.plate("tasks", x.shape[0], dim=-3):
-        m = pyro.sample("m", dist.Normal(m_loc, m_scale_prior))
-        mean = m * x
-        with pyro.plate("data", x.shape[1], dim=-2):
-            pyro.sample("obs", dist.Normal(mean, sigma), obs=y)
+    with pyro.plate("tasks", n_tasks):
+        m = pyro.sample(
+            "m", dist.Normal(m_loc_prior, m_scale_prior).expand([d_y, d_x]).to_event(2)
+        )
+        assert m.shape == (n_tasks, d_y, d_x)
+        mean = torch.einsum("lyx,nlx->nly", m, x)
+        assert mean.shape == (n_points, n_tasks, d_y)
+        with pyro.plate("data", n_points):
+            obs = pyro.sample("obs", dist.Normal(mean, sigma).to_event(1), obs=y)
+            assert obs.shape == (n_points, n_tasks, d_y)
     return mean
 
 
-def mtblr_guide(x, y=None):
+def mtblr_guide(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
     check_shapes(x=x, y=y)
-    sigma_scale = 1e-4
+    n_points = x.shape[0]
+    n_tasks = x.shape[1]
+    d_x = x.shape[2]
+    if y is not None:
+        assert y.shape == (n_points, n_tasks, d_y)
 
+    sigma_scale = 1e-4
     sigma_loc = pyro.param(
         "sigma_loc", torch.tensor(1.0), constraint=constraints.positive
     )
     pyro.sample("sigma", dist.Normal(max(sigma_loc, 5 * sigma_scale), sigma_scale))
-    with pyro.plate("tasks", x.shape[0], dim=-3):
-        m_loc = pyro.param("m_loc", torch.randn((x.shape[0], 1, 1)))
+    with pyro.plate("tasks", n_tasks):
+        m_loc = pyro.param("m_loc", torch.randn((n_tasks, d_y, d_x)))
         m_scale = pyro.param(
-            "m_scale", torch.ones((x.shape[0], 1, 1)), constraint=constraints.positive
+            "m_scale", torch.ones((n_tasks, d_y, d_x)), constraint=constraints.positive
         )
-        pyro.sample("m", dist.Normal(m_loc, m_scale))
+        m = pyro.sample("m", dist.Normal(m_loc, m_scale).to_event(2))
+        assert m.shape == (n_tasks, d_y, d_x)
 
 
-def predict(model, guide, x: np.ndarray, n_samples: int):
+def predict(model, guide, x: np.ndarray, d_y: int, n_samples: int):
+    # TODO: understand shapes of svi_samples
     predictive = Predictive(
         model=model,
         guide=guide,
@@ -66,7 +85,7 @@ def predict(model, guide, x: np.ndarray, n_samples: int):
             "_RETURN",
         ),
     )
-    svi_samples = predictive(x=torch.tensor(x), y=None)
+    svi_samples = predictive(x=torch.tensor(x), d_y=d_y, y=None)
     svi_samples = {k: v for k, v in svi_samples.items()}
     pred_summary = summary(svi_samples)
 
@@ -104,32 +123,32 @@ def plot_predictions(
     obs_perc5_plt = pred_summary["obs"]["5%"].squeeze(-1)
     obs_perc95_plt = pred_summary["obs"]["95%"].squeeze(-1)
     for l in range(n_task):
-        base_line = ax.plot(x_pred[l], means_plt[l])[0]
-        ax.scatter(x_train[l], y_train[l], color=base_line.get_color())
+        base_line = ax.plot(x_pred[:, l], means_plt[:, l])[0]
+        ax.scatter(x_train[:, l], y_train[:, l], color=base_line.get_color())
         if not plot_obs:
             ax.fill_between(
-                x_pred[l],
-                means_perc5_plt[l],
-                means_perc95_plt[l],
+                x_pred[:, l],
+                means_perc5_plt[:, l],
+                means_perc95_plt[:, l],
                 alpha=0.3,
                 color=base_line.get_color(),
             )
         else:
             ax.fill_between(
-                x_pred[l],
-                obs_perc5_plt[l],
-                obs_perc95_plt[l],
+                x_pred[:, l],
+                obs_perc5_plt[:, l],
+                obs_perc95_plt[:, l],
                 alpha=0.3,
                 color=base_line.get_color(),
             )
 
 
 def collate_data(bm: MetaLearningBenchmark):
-    x = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_x))
-    y = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_y))
+    x = np.zeros((bm.n_points_per_task, bm.n_task, bm.d_x))
+    y = np.zeros((bm.n_points_per_task, bm.n_task, bm.d_y))
     for l, task in enumerate(bm):
-        x[l] = task.x
-        y[l] = task.y
+        x[:, l] = task.x
+        y[:, l] = task.y
     return x, y
 
 
@@ -144,7 +163,7 @@ if __name__ == "__main__":
     n_points_per_task = 16
     output_noise = 0.35
     n_pred = 100
-    x_pred = np.linspace(-1.0, 1.0, n_pred)[None, :, None].repeat(n_task, axis=0)
+    x_pred = np.linspace(-1.0, 1.0, n_pred)[:, None, None].repeat(n_task, axis=1)
     n_iter = 1000 if not smoke_test else 10
     n_samples = 1000 if not smoke_test else 10
 
@@ -161,7 +180,7 @@ if __name__ == "__main__":
 
     # obtain predictions before training
     pred_summary_prior_untrained, samples_prior_untrained = predict(
-        model=mtblr_model, guide=None, x=x_pred, n_samples=n_samples
+        model=mtblr_model, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # now do inference
@@ -169,7 +188,7 @@ if __name__ == "__main__":
     svi = SVI(model=mtblr_model, guide=mtblr_guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
     for i in range(n_iter):
-        elbo = svi.step(x=torch.tensor(x), y=torch.tensor(y))
+        elbo = svi.step(x=torch.tensor(x), d_y=bm.d_y, y=torch.tensor(y))
         if i % 10 == 0:
             print(f"[iter {i:04d}] elbo = {elbo:.4f}")
 
@@ -179,12 +198,12 @@ if __name__ == "__main__":
 
     # obtain prior predictions
     pred_summary_prior, samples_prior = predict(
-        model=mtblr_model, guide=None, x=x_pred, n_samples=n_samples
+        model=mtblr_model, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # obtain posterior predictions
     pred_summary_posterior, samples_posterior = predict(
-        model=mtblr_model, guide=mtblr_guide, x=x_pred, n_samples=n_samples
+        model=mtblr_model, guide=mtblr_guide, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # plot predictions
@@ -278,19 +297,25 @@ if __name__ == "__main__":
         ax = axes[0]
         ax.set_title("Prior distribution (untrained)")
         sns.distplot(
-            samples_prior_untrained["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax
+            samples_prior_untrained["m"].squeeze()[:, l],
+            kde_kws={"label": f"Task {l}"},
+            ax=ax,
         )
         ax.axvline(x=task.param[0], color=sns.color_palette()[l])
 
         ax = axes[1]
         ax.set_title("Prior distribution (trained)")
-        sns.distplot(samples_prior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax)
+        sns.distplot(
+            samples_prior["m"].squeeze()[:, l], kde_kws={"label": f"Task {l}"}, ax=ax
+        )
         ax.axvline(x=task.param[0], color=sns.color_palette()[l])
 
         ax = axes[2]
         ax.set_title("Posterior distribution")
         sns.distplot(
-            samples_posterior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax
+            samples_posterior["m"].squeeze()[:, l],
+            kde_kws={"label": f"Task {l}"},
+            ax=ax,
         )
         ax.axvline(x=task.param[0], color=sns.color_palette()[l])
     axes[0].legend()
