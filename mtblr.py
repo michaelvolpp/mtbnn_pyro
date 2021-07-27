@@ -25,22 +25,27 @@ def check_shapes(x, y):
 def mtblr_model(x, y=None):
     check_shapes(x=x, y=y)
 
-    sigma = pyro.sample("sigma", dist.Uniform(0.0, 2.0))
+    m_loc = pyro.param("m_loc_prior", torch.tensor(0.0))
+    m_scale_prior = pyro.param(
+        "m_scale_prior", torch.tensor(1.0), constraint=constraints.positive
+    )
+    sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
     with pyro.plate("tasks", x.shape[0], dim=-3):
-        m = pyro.sample("m", dist.Normal(0.0, 1.0))
+        m = pyro.sample("m", dist.Normal(m_loc, m_scale_prior))
         mean = m * x
         with pyro.plate("data", x.shape[1], dim=-2):
-            obs = pyro.sample("obs", dist.Normal(mean, sigma), obs=y)
+            pyro.sample("obs", dist.Normal(mean, sigma), obs=y)
     return mean
 
 
 def mtblr_guide(x, y=None):
     check_shapes(x=x, y=y)
+    sigma_scale = 1e-4
 
     sigma_loc = pyro.param(
         "sigma_loc", torch.tensor(1.0), constraint=constraints.positive
     )
-    pyro.sample("sigma", dist.Uniform(max(sigma_loc - 0.05, 0.0), sigma_loc + 0.05))
+    pyro.sample("sigma", dist.Normal(max(sigma_loc, 5 * sigma_scale), sigma_scale))
     with pyro.plate("tasks", x.shape[0], dim=-3):
         m_loc = pyro.param("m_loc", torch.randn((x.shape[0], 1, 1)))
         m_scale = pyro.param(
@@ -129,12 +134,17 @@ def collate_data(bm: MetaLearningBenchmark):
 
 
 if __name__ == "__main__":
+    # seed
+    pyro.set_rng_seed(123)
+
     # flags, constants
     plot = True
     smoke_test = False
-    n_task = 4
-    n_points_per_task = 8
-    output_noise = 0.1
+    n_task = 6
+    n_points_per_task = 16
+    output_noise = 0.35
+    n_pred = 100
+    x_pred = np.linspace(-1.0, 1.0, n_pred)[None, :, None].repeat(n_task, axis=0)
     n_iter = 1000 if not smoke_test else 10
     n_samples = 1000 if not smoke_test else 10
 
@@ -148,6 +158,11 @@ if __name__ == "__main__":
         seed_noise=1236,
     )
     x, y = collate_data(bm=bm)
+
+    # obtain predictions before training
+    pred_summary_prior_untrained, samples_prior_untrained = predict(
+        model=mtblr_model, guide=None, x=x_pred, n_samples=n_samples
+    )
 
     # now do inference
     adam = Adam({"lr": 0.05})
@@ -163,8 +178,6 @@ if __name__ == "__main__":
         print(name, pyro.param(name))
 
     # obtain prior predictions
-    n_pred = 100
-    x_pred = np.linspace(-1.0, 1.0, n_pred)[None, :, None].repeat(n_task, axis=0)
     pred_summary_prior, samples_prior = predict(
         model=mtblr_model, guide=None, x=x_pred, n_samples=n_samples
     )
@@ -176,13 +189,26 @@ if __name__ == "__main__":
 
     # plot predictions
     if plot:
-        fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(12, 6), sharey=True)
+        fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(12, 6), sharey=True)
         fig.suptitle("Prior and Posterior Predictions")
 
         ax = axes[0, 0]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Prior Mean")
+        ax.set_title("Prior Mean (untrained)")
+        plot_predictions(
+            x_train=x,
+            y_train=y,
+            x_pred=x_pred,
+            pred_summary=pred_summary_prior_untrained,
+            ax=ax,
+            plot_obs=False,
+        )
+
+        ax = axes[0, 1]
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title("Posterior Mean (trained)")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -192,10 +218,10 @@ if __name__ == "__main__":
             plot_obs=False,
         )
 
-        ax = axes[0, 1]
+        ax = axes[0, 2]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Posterior Mean")
+        ax.set_title("Posterior Mean (untrained)")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -208,7 +234,20 @@ if __name__ == "__main__":
         ax = axes[1, 0]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Prior Observation")
+        ax.set_title("Prior Observation (untrained)")
+        plot_predictions(
+            x_train=x,
+            y_train=y,
+            x_pred=x_pred,
+            pred_summary=pred_summary_prior_untrained,
+            ax=ax,
+            plot_obs=True,
+        )
+
+        ax = axes[1, 1]
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title("Prior Observation (trained)")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -218,7 +257,7 @@ if __name__ == "__main__":
             plot_obs=True,
         )
 
-        ax = axes[1, 1]
+        ax = axes[1, 2]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_title("Posterior Observation")
@@ -232,16 +271,32 @@ if __name__ == "__main__":
         )
 
     # plot prior and posterior
-    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 6), sharex=True)
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6), sharex=True)
     fig.suptitle("Prior and Posterior Distributions")
 
-    for l in range(n_task):
+    for l, task in enumerate(bm):
         ax = axes[0]
-        sns.distplot(samples_prior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax)
+        ax.set_title("Prior distribution (untrained)")
+        sns.distplot(
+            samples_prior_untrained["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax
+        )
+        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
+
         ax = axes[1]
+        ax.set_title("Prior distribution (trained)")
+        sns.distplot(samples_prior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax)
+        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
+
+        ax = axes[2]
+        ax.set_title("Posterior distribution")
         sns.distplot(
             samples_posterior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax
         )
+        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
     axes[0].legend()
     axes[1].legend()
+    axes[2].legend()
+    axes[0].set_xlabel("m")
+    axes[1].set_xlabel("m")
+    axes[2].set_xlabel("m")
     plt.show()
