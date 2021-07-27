@@ -3,11 +3,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import pyro
+import seaborn as sns
 import torch
 from matplotlib import pyplot as plt
 from metalearning_benchmarks import Linear1D
-from metalearning_benchmarks.benchmarks.base_benchmark import \
-    MetaLearningBenchmark
+from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchmark
 from numpy.core.fromnumeric import sort
 from pyro import distributions as dist
 from pyro.distributions import constraints
@@ -65,7 +65,7 @@ def predict(model, guide, x: np.ndarray, n_samples: int):
     svi_samples = {k: v for k, v in svi_samples.items()}
     pred_summary = summary(svi_samples)
 
-    return pred_summary
+    return pred_summary, svi_samples
 
 
 def summary(samples):
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     plot = True
     smoke_test = False
     n_task = 4
-    n_points_per_task = 2
+    n_points_per_task = 8
     output_noise = 0.1
     n_iter = 1000 if not smoke_test else 10
     n_samples = 1000 if not smoke_test else 10
@@ -165,24 +165,24 @@ if __name__ == "__main__":
     # obtain prior predictions
     n_pred = 100
     x_pred = np.linspace(-1.0, 1.0, n_pred)[None, :, None].repeat(n_task, axis=0)
-    pred_summary_prior = predict(
+    pred_summary_prior, samples_prior = predict(
         model=mtblr_model, guide=None, x=x_pred, n_samples=n_samples
     )
 
     # obtain posterior predictions
-    pred_summary_posterior = predict(
+    pred_summary_posterior, samples_posterior = predict(
         model=mtblr_model, guide=mtblr_guide, x=x_pred, n_samples=n_samples
     )
 
-    # plot some prior predictions
+    # plot predictions
     if plot:
         fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(12, 6), sharey=True)
-        fig.suptitle("Predictions")
+        fig.suptitle("Prior and Posterior Predictions")
 
         ax = axes[0, 0]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Prior mean")
+        ax.set_title("Prior Mean")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -195,7 +195,7 @@ if __name__ == "__main__":
         ax = axes[0, 1]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Posterior mean")
+        ax.set_title("Posterior Mean")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -208,7 +208,7 @@ if __name__ == "__main__":
         ax = axes[1, 0]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Prior observation")
+        ax.set_title("Prior Observation")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         ax = axes[1, 1]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title("Posterior observation")
+        ax.set_title("Posterior Observation")
         plot_predictions(
             x_train=x,
             y_train=y,
@@ -230,4 +230,18 @@ if __name__ == "__main__":
             ax=ax,
             plot_obs=True,
         )
-        plt.show()
+
+    # plot prior and posterior
+    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 6), sharex=True)
+    fig.suptitle("Prior and Posterior Distributions")
+
+    for l in range(n_task):
+        ax = axes[0]
+        sns.distplot(samples_prior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax)
+        ax = axes[1]
+        sns.distplot(
+            samples_posterior["m"][:, l], kde_kws={"label": f"Task {l}"}, ax=ax
+        )
+    axes[0].legend()
+    axes[1].legend()
+    plt.show()
