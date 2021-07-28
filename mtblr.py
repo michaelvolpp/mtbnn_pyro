@@ -6,14 +6,14 @@ import pyro
 import seaborn as sns
 import torch
 from matplotlib import pyplot as plt
-from metalearning_benchmarks import Linear1D
+from metalearning_benchmarks import Affine1D, Linear1D
 from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchmark
 from numpy.core.fromnumeric import sort
 from pyro import distributions as dist
 from pyro.distributions import constraints
 from pyro.infer import SVI, Predictive, Trace_ELBO, TraceEnum_ELBO
 from pyro.infer.autoguide import AutoDiagonalNormal
-from pyro.nn import PyroModule, PyroSample
+from pyro.nn import PyroModule, PyroParam, PyroSample
 from pyro.optim import Adam
 from torch import nn
 
@@ -28,30 +28,57 @@ def check_shapes(x, y):
 class BayesianLinear(PyroModule):
     def __init__(self, in_features, out_features, bias=False):
         super().__init__()
-        if bias:
-            raise NotImplementedError
 
-        self.m_loc_prior = pyro.param("m_loc_prior", torch.tensor(0.0))
-        self.m_scale_prior = pyro.param(
-            "m_scale_prior",
-            torch.tensor(1.0),
+        self.weight_loc_prior = PyroParam(
+            init_value=torch.tensor(0.0),
+            constraint=constraints.real,
+        )
+        self.weight_scale_prior = PyroParam(
+            init_value=torch.tensor(1.0),
             constraint=constraints.positive,
         )
-        self.m = PyroSample(
-            dist.Normal(self.m_loc_prior, self.m_scale_prior)
+        # https://docs.pyro.ai/en/dev/nn.html#pyro.nn.module.PyroSample
+        # https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
+        self.weight = PyroSample(
+            lambda self: dist.Normal(self.weight_loc_prior, self.weight_scale_prior)
             .expand([in_features, out_features])
             .to_event(2)
         )
 
+        if bias:
+            self.bias_loc_prior = PyroParam(
+                init_value=torch.tensor(0.0),
+                constraint=constraints.real,
+            )
+            self.bias_scale_prior = PyroParam(
+                init_value=torch.tensor(1.0),
+                constraint=constraints.positive,
+            )
+            # https://docs.pyro.ai/en/dev/nn.html#pyro.nn.module.PyroSample
+            # https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
+            self.bias = PyroSample(
+                lambda self: dist.Normal(self.bias_loc_prior, self.bias_scale_prior)
+                .expand([out_features])
+                .to_event(1)
+            )
+
     def forward(self, x):
-        assert self.m.ndim == x.ndim == 3
-        y = torch.einsum("lyx,nlx->nly", self.m, x)
+        assert self.weight.ndim == x.ndim == 3
+        assert self.bias.ndim == 2
+        y = torch.einsum("lyx,nlx->nly", self.weight, x)
+        y = y + self.bias[None, :, :]
         return y
+
 
 class MTBLR(PyroModule):
     def __init__(self, d_x: int, d_y: int):
         super().__init__()
-        self.linear = BayesianLinear(in_features=d_x, out_features=d_y, bias=False)
+
+        self.linear = BayesianLinear(
+            in_features=d_x,
+            out_features=d_y,
+            bias=True,
+        )
 
     def forward(self, x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
         check_shapes(x=x, y=y)
@@ -61,6 +88,7 @@ class MTBLR(PyroModule):
         if y is not None:
             assert y.shape == (n_points, n_tasks, d_y)
 
+        # wrap this in a softplus?
         sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
         with pyro.plate("tasks", n_tasks):
             mean = self.linear(x)
@@ -100,7 +128,8 @@ def predict(model, guide, x: np.ndarray, d_y: int, n_samples: int):
         guide=guide,
         num_samples=n_samples,
         return_sites=(
-            "m",
+            "linear.weight",
+            "linear.bias",
             "obs",
             "sigma",
             "_RETURN",
@@ -125,13 +154,14 @@ def summary(samples):
     return site_stats
 
 
-def plot_predictions(
+def plot_one_prediction(
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_pred: np.ndarray,
     pred_summary: dict,
     plot_obs: bool,
     ax: None,
+    max_tasks: int,
 ):
     if ax is None:
         fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12, 6))
@@ -144,6 +174,8 @@ def plot_predictions(
     obs_perc5_plt = pred_summary["obs"]["5%"].squeeze(-1)
     obs_perc95_plt = pred_summary["obs"]["95%"].squeeze(-1)
     for l in range(n_task):
+        if l == max_tasks:
+            break
         base_line = ax.plot(x_pred[:, l], means_plt[:, l])[0]
         ax.scatter(x_train[:, l], y_train[:, l], color=base_line.get_color())
         if not plot_obs:
@@ -162,6 +194,158 @@ def plot_predictions(
                 alpha=0.3,
                 color=base_line.get_color(),
             )
+
+
+def plot_predictions(
+    x_train,
+    y_train,
+    x_pred,
+    pred_summary_prior_untrained,
+    pred_summary_prior,
+    pred_summary_posterior,
+    max_tasks=3
+):
+    assert x_train.shape[-1] == y_train.shape[-1] == x_pred.shape[-1]
+
+    fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(12, 6), sharey=True)
+    fig.suptitle(f"Prior and Posterior Predictions")
+
+    ax = axes[0, 0]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Prior Mean (untrained)")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_prior_untrained,
+        ax=ax,
+        plot_obs=False,
+        max_tasks=max_tasks
+    )
+
+    ax = axes[0, 1]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Prior Mean (trained)")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_prior,
+        ax=ax,
+        plot_obs=False,
+        max_tasks=max_tasks
+    )
+
+    ax = axes[0, 2]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Posterior Mean")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_posterior,
+        ax=ax,
+        plot_obs=False,
+        max_tasks=max_tasks
+    )
+
+    ax = axes[1, 0]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Prior Observation (untrained)")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_prior_untrained,
+        ax=ax,
+        plot_obs=True,
+        max_tasks=max_tasks
+    )
+
+    ax = axes[1, 1]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Prior Observation (trained)")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_prior,
+        ax=ax,
+        plot_obs=True,
+        max_tasks=max_tasks
+    )
+
+    ax = axes[1, 2]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Posterior Observation")
+    plot_one_prediction(
+        x_train=x_train,
+        y_train=y_train,
+        x_pred=x_pred,
+        pred_summary=pred_summary_posterior,
+        ax=ax,
+        plot_obs=True,
+        max_tasks=max_tasks
+    )
+
+
+def plot_distributions(
+    site_name,
+    bm,
+    bm_param_idx,
+    samples_prior_untrained,
+    samples_prior,
+    samples_posterior,
+    max_tasks=3
+):
+    # TODO: why do we need to squeeze the slope samples?
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6), sharex=True)
+    fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
+
+    for l, task in enumerate(bm):
+        if l == max_tasks:
+            break
+        ax = axes[0]
+        ax.set_title("Prior distribution (untrained)")
+        sns.distplot(
+            samples_prior_untrained[site_name].squeeze()[:, l],
+            kde_kws={"label": f"Task {l}"},
+            ax=ax,
+        )
+        if bm_param_idx is not None:
+            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+
+        ax = axes[1]
+        ax.set_title("Prior distribution (trained)")
+        sns.distplot(
+            samples_prior[site_name].squeeze()[:, l],
+            kde_kws={"label": f"Task {l}"},
+            ax=ax,
+        )
+        if bm_param_idx is not None:
+            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+
+        ax = axes[2]
+        ax.set_title("Posterior distribution")
+        sns.distplot(
+            samples_posterior[site_name].squeeze()[:, l],
+            kde_kws={"label": f"Task {l}"},
+            ax=ax,
+        )
+        if bm_param_idx is not None:
+            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+    axes[0].legend()
+    axes[1].legend()
+    axes[2].legend()
+    axes[0].set_xlabel("m")
+    axes[1].set_xlabel("m")
+    axes[2].set_xlabel("m")
 
 
 def collate_data(bm: MetaLearningBenchmark):
@@ -189,7 +373,7 @@ if __name__ == "__main__":
     n_samples = 1000 if not smoke_test else 10
 
     # create benchmark
-    bm = Linear1D(
+    bm = Affine1D(
         n_task=n_task,
         n_datapoints_per_task=n_points_per_task,
         output_noise=output_noise,
@@ -202,21 +386,27 @@ if __name__ == "__main__":
     # create model
     mtblr = MTBLR(d_x=bm.d_x, d_y=bm.d_y)
 
+    for name, value in pyro.get_param_store().items():
+        print(name, pyro.param(name))
+
     # obtain predictions before training
     mtblr.eval()
     pred_summary_prior_untrained, samples_prior_untrained = predict(
         model=mtblr, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
+    for name, value in pyro.get_param_store().items():
+        print(name, pyro.param(name))
+
     # now do inference
     mtblr.train()
     adam = Adam({"lr": 0.05})
-    guide = AutoDiagonalNormal(model=mtblr) 
+    guide = AutoDiagonalNormal(model=mtblr)
     svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
     for i in range(n_iter):
         elbo = svi.step(x=torch.tensor(x), d_y=bm.d_y, y=torch.tensor(y))
-        if i % 10 == 0:
+        if i % 100 == 0:
             print(f"[iter {i:04d}] elbo = {elbo:.4f}")
 
     # print learned parameters
@@ -235,120 +425,32 @@ if __name__ == "__main__":
 
     # plot predictions
     if plot:
-        fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(12, 6), sharey=True)
-        fig.suptitle("Prior and Posterior Predictions")
-
-        ax = axes[0, 0]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Prior Mean (untrained)")
         plot_predictions(
             x_train=x,
             y_train=y,
             x_pred=x_pred,
-            pred_summary=pred_summary_prior_untrained,
-            ax=ax,
-            plot_obs=False,
+            pred_summary_prior_untrained=pred_summary_prior_untrained,
+            pred_summary_prior=pred_summary_prior,
+            pred_summary_posterior=pred_summary_posterior,
         )
 
-        ax = axes[0, 1]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Posterior Mean (trained)")
-        plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary=pred_summary_prior,
-            ax=ax,
-            plot_obs=False,
+        # plot prior and posterior distributions
+        plot_distributions(
+            site_name="linear.weight",
+            bm=bm,
+            bm_param_idx=0,
+            samples_prior_untrained=samples_prior_untrained,
+            samples_prior=samples_prior,
+            samples_posterior=samples_posterior,
         )
 
-        ax = axes[0, 2]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Posterior Mean (untrained)")
-        plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary=pred_summary_posterior,
-            ax=ax,
-            plot_obs=False,
+        plot_distributions(
+            site_name="linear.bias",
+            bm=bm,
+            bm_param_idx=1,
+            samples_prior_untrained=samples_prior_untrained,
+            samples_prior=samples_prior,
+            samples_posterior=samples_posterior,
         )
 
-        ax = axes[1, 0]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Prior Observation (untrained)")
-        plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary=pred_summary_prior_untrained,
-            ax=ax,
-            plot_obs=True,
-        )
-
-        ax = axes[1, 1]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Prior Observation (trained)")
-        plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary=pred_summary_prior,
-            ax=ax,
-            plot_obs=True,
-        )
-
-        ax = axes[1, 2]
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title("Posterior Observation")
-        plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary=pred_summary_posterior,
-            ax=ax,
-            plot_obs=True,
-        )
-
-    # plot prior and posterior
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6), sharex=True)
-    fig.suptitle("Prior and Posterior Distributions")
-
-    for l, task in enumerate(bm):
-        ax = axes[0]
-        ax.set_title("Prior distribution (untrained)")
-        sns.distplot(
-            samples_prior_untrained["m"].squeeze()[:, l],
-            kde_kws={"label": f"Task {l}"},
-            ax=ax,
-        )
-        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
-
-        ax = axes[1]
-        ax.set_title("Prior distribution (trained)")
-        sns.distplot(
-            samples_prior["m"].squeeze()[:, l], kde_kws={"label": f"Task {l}"}, ax=ax
-        )
-        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
-
-        ax = axes[2]
-        ax.set_title("Posterior distribution")
-        sns.distplot(
-            samples_posterior["m"].squeeze()[:, l],
-            kde_kws={"label": f"Task {l}"},
-            ax=ax,
-        )
-        ax.axvline(x=task.param[0], color=sns.color_palette()[l])
-    axes[0].legend()
-    axes[1].legend()
-    axes[2].legend()
-    axes[0].set_xlabel("m")
-    axes[1].set_xlabel("m")
-    axes[2].set_xlabel("m")
-    plt.show()
+        plt.show()
