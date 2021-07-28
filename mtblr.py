@@ -11,8 +11,11 @@ from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchm
 from numpy.core.fromnumeric import sort
 from pyro import distributions as dist
 from pyro.distributions import constraints
-from pyro.infer import SVI, Predictive, Trace_ELBO
+from pyro.infer import SVI, Predictive, Trace_ELBO, TraceEnum_ELBO
+from pyro.infer.autoguide import AutoDiagonalNormal
+from pyro.nn import PyroModule, PyroSample
 from pyro.optim import Adam
+from torch import nn
 
 
 def check_shapes(x, y):
@@ -22,32 +25,50 @@ def check_shapes(x, y):
         assert x.shape == y.shape  # d_y = 1
 
 
-def mtblr_model(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
-    check_shapes(x=x, y=y)
-    n_points = x.shape[0]
-    n_tasks = x.shape[1]
-    d_x = x.shape[2]
-    if y is not None:
-        assert y.shape == (n_points, n_tasks, d_y)
+class BayesianLinear(PyroModule):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        if bias:
+            raise NotImplementedError
 
-    m_loc_prior = pyro.param("m_loc_prior", torch.tensor(0.0))
-    m_scale_prior = pyro.param(
-        "m_scale_prior",
-        torch.tensor(1.0),
-        constraint=constraints.positive,
-    )
-    sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
-    with pyro.plate("tasks", n_tasks):
-        m = pyro.sample(
-            "m", dist.Normal(m_loc_prior, m_scale_prior).expand([d_y, d_x]).to_event(2)
+        self.m_loc_prior = pyro.param("m_loc_prior", torch.tensor(0.0))
+        self.m_scale_prior = pyro.param(
+            "m_scale_prior",
+            torch.tensor(1.0),
+            constraint=constraints.positive,
         )
-        assert m.shape == (n_tasks, d_y, d_x)
-        mean = torch.einsum("lyx,nlx->nly", m, x)
-        assert mean.shape == (n_points, n_tasks, d_y)
-        with pyro.plate("data", n_points):
-            obs = pyro.sample("obs", dist.Normal(mean, sigma).to_event(1), obs=y)
-            assert obs.shape == (n_points, n_tasks, d_y)
-    return mean
+        self.m = PyroSample(
+            dist.Normal(self.m_loc_prior, self.m_scale_prior)
+            .expand([in_features, out_features])
+            .to_event(2)
+        )
+
+    def forward(self, x):
+        assert self.m.ndim == x.ndim == 3
+        y = torch.einsum("lyx,nlx->nly", self.m, x)
+        return y
+
+class MTBLR(PyroModule):
+    def __init__(self, d_x: int, d_y: int):
+        super().__init__()
+        self.linear = BayesianLinear(in_features=d_x, out_features=d_y, bias=False)
+
+    def forward(self, x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
+        check_shapes(x=x, y=y)
+        n_points = x.shape[0]
+        n_tasks = x.shape[1]
+        d_x = x.shape[2]
+        if y is not None:
+            assert y.shape == (n_points, n_tasks, d_y)
+
+        sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
+        with pyro.plate("tasks", n_tasks):
+            mean = self.linear(x)
+            assert mean.shape == (n_points, n_tasks, d_y)
+            with pyro.plate("data", n_points):
+                obs = pyro.sample("obs", dist.Normal(mean, sigma).to_event(1), obs=y)
+                assert obs.shape == (n_points, n_tasks, d_y)
+        return mean
 
 
 def mtblr_guide(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
@@ -178,14 +199,20 @@ if __name__ == "__main__":
     )
     x, y = collate_data(bm=bm)
 
+    # create model
+    mtblr = MTBLR(d_x=bm.d_x, d_y=bm.d_y)
+
     # obtain predictions before training
+    mtblr.eval()
     pred_summary_prior_untrained, samples_prior_untrained = predict(
-        model=mtblr_model, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
+        model=mtblr, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # now do inference
+    mtblr.train()
     adam = Adam({"lr": 0.05})
-    svi = SVI(model=mtblr_model, guide=mtblr_guide, optim=adam, loss=Trace_ELBO())
+    guide = AutoDiagonalNormal(model=mtblr) 
+    svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
     for i in range(n_iter):
         elbo = svi.step(x=torch.tensor(x), d_y=bm.d_y, y=torch.tensor(y))
@@ -198,12 +225,12 @@ if __name__ == "__main__":
 
     # obtain prior predictions
     pred_summary_prior, samples_prior = predict(
-        model=mtblr_model, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
+        model=mtblr, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # obtain posterior predictions
     pred_summary_posterior, samples_posterior = predict(
-        model=mtblr_model, guide=mtblr_guide, x=x_pred, d_y=bm.d_y, n_samples=n_samples
+        model=mtblr, guide=guide, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
     # plot predictions
