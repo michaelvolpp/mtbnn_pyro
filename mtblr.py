@@ -1,3 +1,4 @@
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -6,7 +7,7 @@ import pyro
 import seaborn as sns
 import torch
 from matplotlib import pyplot as plt
-from metalearning_benchmarks import Affine1D, Linear1D
+from metalearning_benchmarks import Affine1D, Linear1D, Quadratic1D
 from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchmark
 from numpy.core.fromnumeric import sort
 from pyro import distributions as dist
@@ -14,21 +15,16 @@ from pyro.distributions import constraints
 from pyro.infer import SVI, Predictive, Trace_ELBO, TraceEnum_ELBO
 from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.nn import PyroModule, PyroParam, PyroSample
-from pyro.optim import Adam
+from pyro.optim import Adam, ClippedAdam
 from torch import nn
-
-
-def check_shapes(x, y):
-    assert x.ndim == 3  # (n_points, n_tasks, d_x)
-    assert x.shape[-1] == 1  # d_x = 1
-    if y is not None:
-        assert x.shape == y.shape  # d_y = 1
 
 
 class BayesianLinear(PyroModule):
     def __init__(self, in_features, out_features, bias=False):
         super().__init__()
 
+        self.in_features = in_features
+        self.out_features = out_features
         self.weight_loc_prior = PyroParam(
             init_value=torch.tensor(0.0),
             constraint=constraints.real,
@@ -41,7 +37,7 @@ class BayesianLinear(PyroModule):
         # https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
         self.weight = PyroSample(
             lambda self: dist.Normal(self.weight_loc_prior, self.weight_scale_prior)
-            .expand([in_features, out_features])
+            .expand([self.out_features, self.in_features])
             .to_event(2)
         )
 
@@ -58,27 +54,46 @@ class BayesianLinear(PyroModule):
             # https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
             self.bias = PyroSample(
                 lambda self: dist.Normal(self.bias_loc_prior, self.bias_scale_prior)
-                .expand([out_features])
+                .expand([self.out_features])
                 .to_event(1)
             )
 
     def forward(self, x):
-        assert self.weight.ndim == x.ndim == 3
-        assert self.bias.ndim == 2
-        y = torch.einsum("lyx,nlx->nly", self.weight, x)
+        assert x.ndim == 3
+        n_tasks = x.shape[1]
+        assert self.weight.shape == (n_tasks, self.out_features, self.in_features)
+        assert self.bias.shape == (n_tasks, self.out_features)
+        # TODO: why do we need x.float() here as soon as we have more than zero layers?
+        y = torch.einsum("lyx,nlx->nly", self.weight, x.float())
         y = y + self.bias[None, :, :]
         return y
 
 
 class MTBLR(PyroModule):
-    def __init__(self, d_x: int, d_y: int):
+    def __init__(self, d_x: int, d_y: int, n_hidden: int, d_hidden: int):
         super().__init__()
 
-        self.linear = BayesianLinear(
-            in_features=d_x,
-            out_features=d_y,
-            bias=True,
-        )
+        if n_hidden == 1:
+            modules = []
+            modules.append(
+                BayesianLinear(in_features=d_x, out_features=d_hidden, bias=True)
+            )
+            modules.append(PyroModule[nn.Tanh]())
+            modules.append(
+                BayesianLinear(in_features=d_hidden, out_features=d_y, bias=True)
+            )
+            self.mtbnn = PyroModule[nn.Sequential](*modules)
+        elif n_hidden == 0:
+            self.mtbnn = BayesianLinear(in_features=d_x, out_features=d_y, bias=True)
+        else:
+            raise NotImplementedError
+
+        # TODO: learn noise prior?
+        # self.sigma_upper_bound = PyroParam(
+        #     init_value=torch.tensor(1.0),
+        #     constraint=constraints.positive,
+        # )
+        # self.sigma = PyroSample(lambda self: dist.Uniform(0.0, self.sigma_upper_bound))
 
     def forward(self, x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
         check_shapes(x=x, y=y)
@@ -89,9 +104,9 @@ class MTBLR(PyroModule):
             assert y.shape == (n_points, n_tasks, d_y)
 
         # wrap this in a softplus?
-        sigma = pyro.sample("sigma", dist.Uniform(0.0, 10.0))
+        sigma = pyro.sample("sigma", dist.Uniform(0.0, 1.0))
         with pyro.plate("tasks", n_tasks):
-            mean = self.linear(x)
+            mean = self.mtbnn(x)
             assert mean.shape == (n_points, n_tasks, d_y)
             with pyro.plate("data", n_points):
                 obs = pyro.sample("obs", dist.Normal(mean, sigma).to_event(1), obs=y)
@@ -99,26 +114,33 @@ class MTBLR(PyroModule):
         return mean
 
 
-def mtblr_guide(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
-    check_shapes(x=x, y=y)
-    n_points = x.shape[0]
-    n_tasks = x.shape[1]
-    d_x = x.shape[2]
+def check_shapes(x, y):
+    assert x.ndim == 3  # (n_points, n_tasks, d_x)
+    assert x.shape[-1] == 1  # d_x = 1
     if y is not None:
-        assert y.shape == (n_points, n_tasks, d_y)
+        assert x.shape == y.shape  # d_y = 1
 
-    sigma_scale = 1e-4
-    sigma_loc = pyro.param(
-        "sigma_loc", torch.tensor(1.0), constraint=constraints.positive
-    )
-    pyro.sample("sigma", dist.Normal(max(sigma_loc, 5 * sigma_scale), sigma_scale))
-    with pyro.plate("tasks", n_tasks):
-        m_loc = pyro.param("m_loc", torch.randn((n_tasks, d_y, d_x)))
-        m_scale = pyro.param(
-            "m_scale", torch.ones((n_tasks, d_y, d_x)), constraint=constraints.positive
-        )
-        m = pyro.sample("m", dist.Normal(m_loc, m_scale).to_event(2))
-        assert m.shape == (n_tasks, d_y, d_x)
+
+# def mtblr_guide(x: torch.tensor, d_y: int, y: Optional[torch.tensor] = None):
+# check_shapes(x=x, y=y)
+# n_points = x.shape[0]
+# n_tasks = x.shape[1]
+# d_x = x.shape[2]
+# if y is not None:
+#     assert y.shape == (n_points, n_tasks, d_y)
+
+# sigma_scale = 1e-4
+# sigma_loc = pyro.param(
+#     "sigma_loc", torch.tensor(1.0), constraint=constraints.positive
+# )
+# pyro.sample("sigma", dist.Normal(max(sigma_loc, 5 * sigma_scale), sigma_scale))
+# with pyro.plate("tasks", n_tasks):
+#     m_loc = pyro.param("m_loc", torch.randn((n_tasks, d_y, d_x)))
+#     m_scale = pyro.param(
+#         "m_scale", torch.ones((n_tasks, d_y, d_x)), constraint=constraints.positive
+#     )
+#     m = pyro.sample("m", dist.Normal(m_loc, m_scale).to_event(2))
+#     assert m.shape == (n_tasks, d_y, d_x)
 
 
 def predict(model, guide, x: np.ndarray, d_y: int, n_samples: int):
@@ -128,8 +150,10 @@ def predict(model, guide, x: np.ndarray, d_y: int, n_samples: int):
         guide=guide,
         num_samples=n_samples,
         return_sites=(
-            "linear.weight",
-            "linear.bias",
+            # if model is linear, those sites are available
+            "mtbnn.weight",
+            "mtbnn.bias",
+            # those sites are always available
             "obs",
             "sigma",
             "_RETURN",
@@ -203,7 +227,7 @@ def plot_predictions(
     pred_summary_prior_untrained,
     pred_summary_prior,
     pred_summary_posterior,
-    max_tasks=3
+    max_tasks=3,
 ):
     assert x_train.shape[-1] == y_train.shape[-1] == x_pred.shape[-1]
 
@@ -221,7 +245,7 @@ def plot_predictions(
         pred_summary=pred_summary_prior_untrained,
         ax=ax,
         plot_obs=False,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
     ax = axes[0, 1]
@@ -235,7 +259,7 @@ def plot_predictions(
         pred_summary=pred_summary_prior,
         ax=ax,
         plot_obs=False,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
     ax = axes[0, 2]
@@ -249,7 +273,7 @@ def plot_predictions(
         pred_summary=pred_summary_posterior,
         ax=ax,
         plot_obs=False,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
     ax = axes[1, 0]
@@ -263,7 +287,7 @@ def plot_predictions(
         pred_summary=pred_summary_prior_untrained,
         ax=ax,
         plot_obs=True,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
     ax = axes[1, 1]
@@ -277,7 +301,7 @@ def plot_predictions(
         pred_summary=pred_summary_prior,
         ax=ax,
         plot_obs=True,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
     ax = axes[1, 2]
@@ -291,7 +315,7 @@ def plot_predictions(
         pred_summary=pred_summary_posterior,
         ax=ax,
         plot_obs=True,
-        max_tasks=max_tasks
+        max_tasks=max_tasks,
     )
 
 
@@ -302,7 +326,7 @@ def plot_distributions(
     samples_prior_untrained,
     samples_prior,
     samples_posterior,
-    max_tasks=3
+    max_tasks=3,
 ):
     # TODO: why do we need to squeeze the slope samples?
     fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6), sharex=True)
@@ -357,20 +381,36 @@ def collate_data(bm: MetaLearningBenchmark):
     return x, y
 
 
+def print_parameters():
+    for name, value in pyro.get_param_store().items():
+        print(f"{name}\n{pyro.param(name)}")
+
+
 if __name__ == "__main__":
     # seed
     pyro.set_rng_seed(123)
 
-    # flags, constants
+    ## flags, constants
     plot = True
-    smoke_test = False
-    n_task = 6
-    n_points_per_task = 16
-    output_noise = 0.35
+    smoke_test = True
+    # benchmark
+    n_task = 15
+    n_points_per_task = 32
+    output_noise = 0.01
+    # model
+    n_hidden = 0
+    d_hidden = 2
+    # training
+    n_iter = 10000 if not smoke_test else 1000
+    initial_lr = 0.1
+    gamma = 0.00001  # final learning rate will be gamma * initial_lr
+    lrd = gamma ** (1 / n_iter)
+    adam = ClippedAdam({"lr": initial_lr, "lrd": lrd})
+    # evaluation
     n_pred = 100
-    x_pred = np.linspace(-1.0, 1.0, n_pred)[:, None, None].repeat(n_task, axis=1)
-    n_iter = 1000 if not smoke_test else 10
-    n_samples = 1000 if not smoke_test else 10
+    x_pred = np.linspace(-1.5, 1.5, n_pred)[:, None, None].repeat(n_task, axis=1)
+    n_samples = 1000
+    max_plot_tasks = 5
 
     # create benchmark
     bm = Affine1D(
@@ -384,10 +424,7 @@ if __name__ == "__main__":
     x, y = collate_data(bm=bm)
 
     # create model
-    mtblr = MTBLR(d_x=bm.d_x, d_y=bm.d_y)
-
-    for name, value in pyro.get_param_store().items():
-        print(name, pyro.param(name))
+    mtblr = MTBLR(d_x=bm.d_x, d_y=bm.d_y, n_hidden=n_hidden, d_hidden=d_hidden)
 
     # obtain predictions before training
     mtblr.eval()
@@ -395,12 +432,17 @@ if __name__ == "__main__":
         model=mtblr, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
     )
 
-    for name, value in pyro.get_param_store().items():
-        print(name, pyro.param(name))
+    print("\n************************")
+    print("*** Prior parameters ***")
+    print("************************")
+    print_parameters()
+    print("************************")
 
-    # now do inference
+    # do inference
+    print("\n*******************************")
+    print("*** Performing inference... ***")
+    print("*******************************")
     mtblr.train()
-    adam = Adam({"lr": 0.05})
     guide = AutoDiagonalNormal(model=mtblr)
     svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
@@ -408,10 +450,14 @@ if __name__ == "__main__":
         elbo = svi.step(x=torch.tensor(x), d_y=bm.d_y, y=torch.tensor(y))
         if i % 100 == 0:
             print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+    print("*******************************")
 
     # print learned parameters
-    for name, value in pyro.get_param_store().items():
-        print(name, pyro.param(name))
+    print("\n****************************")
+    print("*** Posterior parameters ***")
+    print("****************************")
+    print_parameters()
+    print("****************************")
 
     # obtain prior predictions
     pred_summary_prior, samples_prior = predict(
@@ -432,25 +478,32 @@ if __name__ == "__main__":
             pred_summary_prior_untrained=pred_summary_prior_untrained,
             pred_summary_prior=pred_summary_prior,
             pred_summary_posterior=pred_summary_posterior,
+            max_tasks=max_plot_tasks,
         )
 
-        # plot prior and posterior distributions
-        plot_distributions(
-            site_name="linear.weight",
-            bm=bm,
-            bm_param_idx=0,
-            samples_prior_untrained=samples_prior_untrained,
-            samples_prior=samples_prior,
-            samples_posterior=samples_posterior,
-        )
+        if n_hidden == 0:
+            # plot prior and posterior distributions
 
-        plot_distributions(
-            site_name="linear.bias",
-            bm=bm,
-            bm_param_idx=1,
-            samples_prior_untrained=samples_prior_untrained,
-            samples_prior=samples_prior,
-            samples_posterior=samples_posterior,
-        )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plot_distributions(
+                    site_name="mtbnn.weight",
+                    bm=bm,
+                    bm_param_idx=0
+                    if isinstance(bm, Linear1D) or isinstance(bm, Affine1D)
+                    else None,
+                    samples_prior_untrained=samples_prior_untrained,
+                    samples_prior=samples_prior,
+                    samples_posterior=samples_posterior,
+                )
+
+                plot_distributions(
+                    site_name="mtbnn.bias",
+                    bm=bm,
+                    bm_param_idx=1 if isinstance(bm, Affine1D) else None,
+                    samples_prior_untrained=samples_prior_untrained,
+                    samples_prior=samples_prior,
+                    samples_posterior=samples_posterior,
+                )
 
         plt.show()
