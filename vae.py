@@ -9,11 +9,10 @@ from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.nn import PyroModule, PyroParam, PyroSample
 from pyro.optim import ClippedAdam
 from torch.nn import Linear, ReLU, Sequential, BatchNorm1d
-from torch.distributions import constraints
 
 
 class VAE(PyroModule):
-    def __init__(self, d_x: int, d_z: int, n_hidden: int, d_hidden: int, eps: float):
+    def __init__(self, d_x: int, d_z: int, n_hidden: int, d_hidden: int):
         super().__init__()
 
         self.d_x = d_x
@@ -30,38 +29,23 @@ class VAE(PyroModule):
             )
             modules.append(PyroModule[ReLU]())
         modules.append(PyroModule[Linear](in_features=d_hidden, out_features=d_x))
-        self.decoder = PyroModule[Sequential](*modules)
+        self.generator = PyroModule[Sequential](*modules)
+
+        # prior
+        self.z = PyroSample(dist.Normal(0.0, 1.0).expand([d_z]).to_event(1))
 
         # noise
-        self.eps = eps
+        self.sigma = PyroSample(dist.Uniform(0.0, 1.0))
 
     def forward(self, x=None):
+        sigma = self.sigma
         n_data = x.shape[0] if x is not None else 1
         with pyro.plate("data", n_data):
-            z_prior_loc = torch.zeros(n_data, self.d_z)
-            z_prior_scale = torch.ones(n_data, self.d_z)
-            z = pyro.sample("z", dist.Normal(z_prior_loc, z_prior_scale).to_event(1))
-            x_gen = self.decoder(z)
-            pyro.sample("obs", dist.Normal(x_gen, self.eps).to_event(1), obs=x)
+            z = self.z
+            x_gen = self.generator(z)
+            pyro.sample("obs", dist.Normal(x_gen, sigma).to_event(1), obs=x)
 
         return x_gen
-
-    def guide_diag_normal(self, x):
-        n_data = x.shape[0]
-        with pyro.plate("data", n_data):
-            z_posterior_loc = pyro.param(
-                "z_posterior_loc",
-                torch.zeros(n_data, self.d_z),
-                constraint=constraints.real,
-            )
-            z_posterior_scale = pyro.param(
-                "z_posterior_scale",
-                torch.ones(n_data, self.d_z),
-                constraint=constraints.positive,
-            )
-            z = pyro.sample(
-                "z", dist.Normal(z_posterior_loc, z_posterior_scale).to_event(1)
-            )
 
 
 def generate_circle_data(n_points, noise):
@@ -83,6 +67,7 @@ def predict(model, guide, x, n_samples: int):
         return_sites=(
             "z",
             "obs",
+            "sigma",
             "_RETURN",
         ),
     )
@@ -119,11 +104,11 @@ if __name__ == "__main__":
     # TODO: try MultivariateNormal guide -> correlations between different z samples
     # constants
     pyro.set_rng_seed(1236)
-    smoke_test = False
+    smoke_test = False 
     n_train = 1000
     noise = 0.01
-    n_pred = 5000 if not smoke_test else 10
-    n_iter = 5000 if not smoke_test else 10
+    n_pred = 5000 if not smoke_test else 100
+    n_iter = 5000 if not smoke_test else 100
     initial_lr = 0.1
     gamma = 0.0001  # final learning rate will be gamma * initial_lr
     lrd = gamma ** (1 / n_iter)
@@ -136,20 +121,15 @@ if __name__ == "__main__":
     x = generate_circle_data(n_points=n_train, noise=noise)
 
     # perform inference
-    vae = VAE(d_x=2, d_z=d_z, n_hidden=n_hidden, d_hidden=d_hidden, eps=noise)
+    vae = VAE(d_x=2, d_z=d_z, n_hidden=n_hidden, d_hidden=d_hidden)
     vae.train()
     guide = AutoDiagonalNormal(model=vae)
-    # guide = vae.guide_diag_normal
     svi = SVI(model=vae, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
     for n in range(n_iter):
         elbo = svi.step(x=torch.tensor(x))
         if n % 100 == 0:
             print(f"[iter {n:04d}] elbo = {elbo:.4f}")
-
-    # print parameters
-    for name, value in pyro.get_param_store().items():
-        print(f"name  = {name}\nshape = {pyro.param(name).shape}")
 
     # generate data
     vae.eval()
