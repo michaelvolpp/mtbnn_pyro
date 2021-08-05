@@ -299,7 +299,11 @@ if __name__ == "__main__":
     n_samples_pred = 100 if not smoke_test else 1
 
     # data
-    x = torch.tensor(generate_spiral_data(n_points=N, noise_stddev=noise_stddev, spiral=True, angle_high=3*np.pi))
+    x = torch.tensor(
+        generate_spiral_data(
+            n_points=N, noise_stddev=noise_stddev, spiral=True, angle_high=3 * np.pi
+        )
+    )
 
     # perform inference
     vae = VAE(d_x=2, d_z=d_z, n_hidden=n_hidden, d_hidden=d_hidden, noise_stddev=None)
