@@ -49,7 +49,7 @@ class BayesianLinear(PyroModule):
         # https://docs.pyro.ai/en/dev/nn.html#pyro.nn.module.PyroSample
         # https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
         self.weight = PyroSample(prior)
-        self.freeze_parameters()
+        # self.freeze_parameters()
 
         if bias:
             self.bias_loc_prior = PyroParam(
@@ -383,9 +383,9 @@ def plot_distributions(
     axes[0].legend()
     axes[1].legend()
     axes[2].legend()
-    axes[0].set_xlabel("m")
-    axes[1].set_xlabel("m")
-    axes[2].set_xlabel("m")
+    axes[0].set_xlabel(site_name)
+    axes[1].set_xlabel(site_name)
+    axes[2].set_xlabel(site_name)
 
 
 def collate_data(bm: MetaLearningBenchmark):
@@ -398,8 +398,12 @@ def collate_data(bm: MetaLearningBenchmark):
 
 
 def print_parameters():
-    for name, value in pyro.get_param_store().items():
-        print(f"{name}\n{pyro.param(name)}")
+    for name in pyro.get_param_store().keys():
+        print(
+            f"\n\nname  = {name}"
+            f"\nshape = {pyro.param(name).shape}"
+            f"\nvalue = {pyro.param(name)}"
+        )
 
 
 def freeze_parameters():
@@ -433,7 +437,7 @@ if __name__ == "__main__":
     # evaluation
     n_pred = 100
     x_pred = np.linspace(-1.5, 1.5, n_pred)[:, None, None].repeat(n_task, axis=1)
-    n_samples = 1000
+    n_samples = 2
     max_plot_tasks = 5
 
     # create benchmark
@@ -451,7 +455,7 @@ if __name__ == "__main__":
     mtblr = MTBLR(d_x=bm.d_x, d_y=bm.d_y, n_hidden=n_hidden, d_hidden=d_hidden)
 
     # obtain predictions before training
-    mtblr.eval()  # TODO: do we need this?
+    mtblr.eval() 
     with torch.no_grad():
         pred_summary_prior_untrained, samples_prior_untrained = predict(
             model=mtblr, guide=None, x=x_pred, d_y=bm.d_y, n_samples=n_samples
@@ -467,7 +471,7 @@ if __name__ == "__main__":
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    mtblr.train()  # TODO: do we need this?
+    mtblr.train()
     guide = AutoDiagonalNormal(model=mtblr)
     svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
