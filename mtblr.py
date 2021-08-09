@@ -478,8 +478,6 @@ def freeze_parameters():
 
 if __name__ == "__main__":
     # TODO: implement adaptation
-    # TODO: use more expressive prior
-    # TODO: multivariate normal guide
     # seed
     pyro.set_rng_seed(123)
 
@@ -492,7 +490,7 @@ if __name__ == "__main__":
     noise_stddev = 0.01
     # model
     n_hidden = 1
-    d_hidden = 4
+    d_hidden = 8
     infer_noise_stddev = False
     prior = "diagonal"
     # training
@@ -556,8 +554,9 @@ if __name__ == "__main__":
     print("*** Performing inference... ***")
     print("*******************************")
     mtblr.train()
-    # guide = AutoDiagonalNormal(model=mtblr)
+    # guide = AutoNormal(model=mtblr)
     guide = AutoDiagonalNormal(model=mtblr)
+    # guide = AutoMultivariateNormal(model=mtblr)
     svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
     pyro.clear_param_store()
     for i in range(n_iter):
