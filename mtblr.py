@@ -34,7 +34,7 @@ class MTBayesianLinear(PyroModule):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        prior: str = "isotropic",
+        prior_type: str = "isotropic",
     ):
         super().__init__()
 
@@ -42,7 +42,7 @@ class MTBayesianLinear(PyroModule):
         self.out_features = out_features
 
         ## weight prior
-        if prior == "isotropic":
+        if prior_type == "isotropic":
             self.weight_prior_loc = PyroParam(
                 init_value=torch.tensor(0.0),
                 constraint=constraints.real,
@@ -56,7 +56,7 @@ class MTBayesianLinear(PyroModule):
                 .expand([self.out_features, self.in_features])
                 .to_event(2)
             )
-        elif prior == "diagonal":
+        elif prior_type == "diagonal":
             self.weight_prior_loc = PyroParam(
                 init_value=torch.zeros(self.out_features, self.in_features),
                 constraint=constraints.real,
@@ -69,12 +69,12 @@ class MTBayesianLinear(PyroModule):
                 self.weight_prior_loc, self.weight_prior_scale
             ).to_event(2)
         else:
-            raise ValueError(f"Unknown prior specification '{prior}'!")
+            raise ValueError(f"Unknown prior specification '{prior_type}'!")
         self.weight = PyroSample(self.weight_prior)
 
         ## bias prior
         if bias:
-            if prior == "isotropic":
+            if prior_type == "isotropic":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.tensor(0.0),
                     constraint=constraints.real,
@@ -88,7 +88,7 @@ class MTBayesianLinear(PyroModule):
                     .expand([self.out_features])
                     .to_event(1)
                 )
-            elif prior == "diagonal":
+            elif prior_type == "diagonal":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.zeros(self.out_features),
                     constraint=constraints.real,
@@ -101,7 +101,7 @@ class MTBayesianLinear(PyroModule):
                     self.bias_prior_loc, self.bias_prior_scale
                 ).to_event(1)
             else:
-                raise ValueError(f"Unknown prior specification '{prior}'!")
+                raise ValueError(f"Unknown prior specification '{prior_type}'!")
             self.bias = PyroSample(self.bias_prior)
 
     def forward(self, x):
@@ -129,7 +129,12 @@ class MTBayesianLinear(PyroModule):
 
 class MTBNN(PyroModule):
     def __init__(
-        self, in_features: int, out_features: int, n_hidden: int, d_hidden: int
+        self,
+        in_features: int,
+        out_features: int,
+        n_hidden: int,
+        d_hidden: int,
+        prior_type: str,
     ):
         super().__init__()
 
@@ -137,19 +142,28 @@ class MTBNN(PyroModule):
             modules = []
             modules.append(
                 MTBayesianLinear(
-                    in_features=in_features, out_features=d_hidden, bias=True
+                    in_features=in_features,
+                    out_features=d_hidden,
+                    bias=True,
+                    prior_type=prior_type,
                 )
             )
             modules.append(PyroModule[nn.Tanh]())
             modules.append(
                 MTBayesianLinear(
-                    in_features=d_hidden, out_features=out_features, bias=True
+                    in_features=d_hidden,
+                    out_features=out_features,
+                    bias=True,
+                    prior_type=prior_type,
                 )
             )
             self.net = PyroModule[nn.Sequential](*modules)
         elif n_hidden == 0:
             self.net = MTBayesianLinear(
-                in_features=in_features, out_features=out_features, bias=True
+                in_features=in_features,
+                out_features=out_features,
+                bias=True,
+                prior_type=prior_type,
             )
         else:
             raise NotImplementedError
@@ -166,12 +180,17 @@ class MTBayesianRegression(PyroModule):
         n_hidden: int,
         d_hidden: int,
         noise_stddev: Optional[float] = None,
+        prior_type: str = "isotropic",
     ):
         super().__init__()
 
         ## multi-task BNN
         self.mtbnn = MTBNN(
-            in_features=d_x, out_features=d_y, n_hidden=n_hidden, d_hidden=d_hidden
+            in_features=d_x,
+            out_features=d_y,
+            n_hidden=n_hidden,
+            d_hidden=d_hidden,
+            prior_type=prior_type,
         )
 
         ## noise stddev
@@ -468,13 +487,14 @@ if __name__ == "__main__":
     plot = True
     smoke_test = False
     # benchmark
-    n_task = 16
-    n_points_per_task = 32
+    n_task = 8
+    n_points_per_task = 16
     noise_stddev = 0.01
     # model
     n_hidden = 1
     d_hidden = 4
     infer_noise_stddev = False
+    prior = "diagonal"
     # training
     n_iter = 5000 if not smoke_test else 1000
     initial_lr = 0.1
@@ -505,6 +525,7 @@ if __name__ == "__main__":
         n_hidden=n_hidden,
         d_hidden=d_hidden,
         noise_stddev=None if infer_noise_stddev else noise_stddev,
+        prior_type=prior,
     )
 
     ## obtain predictions before training
@@ -515,9 +536,13 @@ if __name__ == "__main__":
         )
 
     ## print trace shapes
+    print("\n********************")
+    print("*** Trace shapes ***")
+    print("********************")
     trace = poutine.trace(mtblr).get_trace(x=torch.tensor(x_pred))
     trace.compute_log_prob()
     print(trace.format_shapes())
+    print("********************")
 
     ## print prior parameters
     print("\n************************")
