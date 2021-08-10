@@ -121,10 +121,14 @@ class MTBayesianLinear(PyroModule):
         y = y + self.bias.squeeze(1)[:, None, :]
         return y
 
-    def freeze_parameters(self):
-        # self.weight_loc_prior = self.weight_loc_prior.clone().detach()
-        self.weight_prior_loc = torch.tensor(0.0, requires_grad=False)
-        # self.weight_loc_prior = 0.0
+    # def freeze_prior(self):
+    #     # freeze the unconstrained parameters
+    #     # -> those are the leave variables of the autograd graph
+    #     # -> those are the registered parameters of self
+    #     self.weight_prior_loc_unconstrained.requires_grad = False
+    #     self.weight_prior_scale_unconstrained.requires_grad = False
+    #     self.bias_prior_loc_unconstrained.requires_grad = False
+    #     self.bias_prior_scale_unconstrained.requires_grad = False
 
 
 class MTBNN(PyroModule):
@@ -138,8 +142,18 @@ class MTBNN(PyroModule):
     ):
         super().__init__()
 
-        if n_hidden == 1:
-            modules = []
+        self.n_hidden = n_hidden
+        modules = []
+        if self.n_hidden == 0:
+            modules.append(
+                MTBayesianLinear(
+                    in_features=in_features,
+                    out_features=out_features,
+                    bias=True,
+                    prior_type=prior_type,
+                )
+            )
+        else:
             modules.append(
                 MTBayesianLinear(
                     in_features=in_features,
@@ -149,6 +163,16 @@ class MTBNN(PyroModule):
                 )
             )
             modules.append(PyroModule[nn.Tanh]())
+            for _ in range(self.n_hidden - 1):
+                modules.append(
+                    MTBayesianLinear(
+                        in_features=d_hidden,
+                        out_features=d_hidden,
+                        bias=True,
+                        prior_type=prior_type,
+                    )
+                )
+                modules.append(PyroModule[nn.Tanh]())
             modules.append(
                 MTBayesianLinear(
                     in_features=d_hidden,
@@ -157,19 +181,17 @@ class MTBNN(PyroModule):
                     prior_type=prior_type,
                 )
             )
-            self.net = PyroModule[nn.Sequential](*modules)
-        elif n_hidden == 0:
-            self.net = MTBayesianLinear(
-                in_features=in_features,
-                out_features=out_features,
-                bias=True,
-                prior_type=prior_type,
-            )
-        else:
-            raise NotImplementedError
+        self.net = PyroModule[nn.Sequential](*modules)
 
     def forward(self, x):
         return self.net(x)
+
+    def freeze_prior(self):
+        # freeze the unconstrained parameters
+        # -> those are the leave variables of the autograd graph
+        # -> those are the registered parameters of self
+        for p in self.parameters():
+            p.requires_grad = False
 
 
 class MTBayesianRegression(PyroModule):
@@ -221,6 +243,9 @@ class MTBayesianRegression(PyroModule):
                 )  # score mean predictions against ground truth
         return mean
 
+    def freeze_prior(self):
+        self.mtbnn.freeze_prior()
+
 
 def predict(model, guide, x: np.ndarray, n_samples: int):
     predictive = Predictive(
@@ -229,8 +254,8 @@ def predict(model, guide, x: np.ndarray, n_samples: int):
         num_samples=n_samples,
         return_sites=(
             # if model is linear, those sites are available
-            "mtbnn.net.weight",
-            "mtbnn.net.bias",
+            "mtbnn.net.0.weight",
+            "mtbnn.net.0.bias",
             # those sites are always available
             "obs",
             "sigma",
@@ -257,8 +282,8 @@ def summary(samples):
 
 
 def plot_one_prediction(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
     x_pred: np.ndarray,
     pred_summary: dict,
     plot_obs: bool,
@@ -275,11 +300,13 @@ def plot_one_prediction(
     obs_plt = pred_summary["obs"]["mean"].squeeze(-1)
     obs_perc5_plt = pred_summary["obs"]["5%"].squeeze(-1)
     obs_perc95_plt = pred_summary["obs"]["95%"].squeeze(-1)
+
+    n_task = x.shape[0]
     for l in range(n_task):
         if l == max_tasks:
             break
         base_line = ax.plot(x_pred[l, :], means_plt[l, :])[0]
-        ax.scatter(x_train[l, :], y_train[l, :], color=base_line.get_color())
+        ax.scatter(x[l, :], y[l, :], color=base_line.get_color())
         if not plot_obs:
             ax.fill_between(
                 x_pred[l, :],
@@ -300,28 +327,32 @@ def plot_one_prediction(
 
 
 def plot_predictions(
-    x_train,
-    y_train,
-    x_pred,
-    pred_summary_prior_untrained,
-    pred_summary_prior,
-    pred_summary_posterior,
+    x_source,
+    y_source,
+    x_pred_source,
+    x_target,
+    y_target,
+    x_pred_target,
+    pred_summary_prior_source_untrained,
+    pred_summary_prior_source,
+    pred_summary_posterior_source,
+    pred_summary_posterior_target,
     max_tasks=3,
 ):
-    assert x_train.shape[-1] == y_train.shape[-1] == x_pred.shape[-1]
+    assert x_source.shape[-1] == y_source.shape[-1] == x_pred_source.shape[-1]
 
-    fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(12, 6), sharey=True)
+    fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(12, 6), sharey=True)
     fig.suptitle(f"Prior and Posterior Predictions")
 
     ax = axes[0, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Mean (untrained)")
+    ax.set_title("Prior Mean\n+ Source Data")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_prior_untrained,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_prior_source_untrained,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -330,12 +361,12 @@ def plot_predictions(
     ax = axes[0, 1]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Mean (trained)")
+    ax.set_title("Prior Mean\n(trained on Source Data)")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_prior,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_prior_source,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -344,12 +375,26 @@ def plot_predictions(
     ax = axes[0, 2]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Mean")
+    ax.set_title("Posterior Mean\n(Source)")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_posterior,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_posterior_source,
+        ax=ax,
+        plot_obs=False,
+        max_tasks=max_tasks,
+    )
+
+    ax = axes[0, 3]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Posterior Mean\n(Target)")
+    plot_one_prediction(
+        x=x_target,
+        y=y_target,
+        x_pred=x_pred_target,
+        pred_summary=pred_summary_posterior_target,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -358,12 +403,12 @@ def plot_predictions(
     ax = axes[1, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Observation (untrained)")
+    ax.set_title("Prior Observation\n+ Source Data")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_prior_untrained,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_prior_source_untrained,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -372,12 +417,12 @@ def plot_predictions(
     ax = axes[1, 1]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Observation (trained)")
+    ax.set_title("Prior Observation\n(trained on Source Data)")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_prior,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_prior_source,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -386,12 +431,26 @@ def plot_predictions(
     ax = axes[1, 2]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Observation")
+    ax.set_title("Posterior Observation\n(Source)")
     plot_one_prediction(
-        x_train=x_train,
-        y_train=y_train,
-        x_pred=x_pred,
-        pred_summary=pred_summary_posterior,
+        x=x_source,
+        y=y_source,
+        x_pred=x_pred_source,
+        pred_summary=pred_summary_posterior_source,
+        ax=ax,
+        plot_obs=True,
+        max_tasks=max_tasks,
+    )
+
+    ax = axes[1, 3]
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Posterior Observation\n(Target)")
+    plot_one_prediction(
+        x=x_target,
+        y=y_target,
+        x_pred=x_pred_target,
+        pred_summary=pred_summary_posterior_target,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -463,9 +522,14 @@ def collate_data(bm: MetaLearningBenchmark):
 
 
 def print_parameters():
+    first = True
     for name in pyro.get_param_store().keys():
+        if first:
+            first = False
+        else:
+            print("\n")
         print(
-            f"\n\nname  = {name}"
+            f"name  = {name}"
             f"\nshape = {pyro.param(name).shape}"
             f"\nvalue = {pyro.param(name)}"
         )
@@ -478,48 +542,70 @@ def freeze_parameters():
 
 if __name__ == "__main__":
     # TODO: implement adaptation
+    # TODO: sample functions
+    # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
+
     # seed
     pyro.set_rng_seed(123)
 
     ## flags, constants
     plot = True
-    smoke_test = False
+    smoke_test = True
     # benchmark
-    n_task = 8
-    n_points_per_task = 16
+    n_task_source = 8
+    n_points_per_task_source = 16
     noise_stddev = 0.01
     # model
-    n_hidden = 1
+    n_hidden = 0
     d_hidden = 8
     infer_noise_stddev = False
     prior = "diagonal"
     # training
-    n_iter = 5000 if not smoke_test else 1000
-    initial_lr = 0.1
-    gamma = 0.00001  # final learning rate will be gamma * initial_lr
-    lrd = gamma ** (1 / n_iter)
-    adam = ClippedAdam({"lr": initial_lr, "lrd": lrd})
+    do_source_training = True 
+    n_iter_source = 5000 if not smoke_test else 1000
+    initial_lr_source = 0.1
+    gamma_source = 0.00001  # final learning rate will be gamma * initial_lr
+    lrd_source = gamma_source ** (1 / n_iter_source)
+    adam_source = ClippedAdam({"lr": initial_lr_source, "lrd": lrd_source})
+    # adaptation
+    n_iter_target = 250
+    lr_target = 0.01
+    adam_target = ClippedAdam({"lr": lr_target})
     # evaluation
     n_pred = 100
-    x_pred = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(n_task, axis=0)
     n_samples = 1000
     max_plot_tasks = 5
 
-    # create benchmark
-    bm = Affine1D(
-        n_task=n_task,
-        n_datapoints_per_task=n_points_per_task,
+    ## create benchmarks
+    # source benchmark
+    bm_source = Affine1D(
+        n_task=n_task_source,
+        n_datapoints_per_task=n_points_per_task_source,
         output_noise=noise_stddev,
         seed_task=1234,
         seed_x=1235,
         seed_noise=1236,
     )
-    x, y = collate_data(bm=bm)
+    x_source, y_source = collate_data(bm=bm_source)
+    x_pred_source = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(
+        n_task_source, axis=0
+    )
+    # target benchmark
+    bm_test = Affine1D(
+        n_task=1,
+        n_datapoints_per_task=n_points_per_task_source,
+        output_noise=noise_stddev,
+        seed_task=1235,
+        seed_x=1236,
+        seed_noise=1237,
+    )
+    x_target, y_target = collate_data(bm=bm_test)
+    x_pred_target = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(1, axis=0)
 
     # create model
-    mtblr = MTBayesianRegression(
-        d_x=bm.d_x,
-        d_y=bm.d_y,
+    mtbreg = MTBayesianRegression(
+        d_x=bm_source.d_x,
+        d_y=bm_source.d_y,
         n_hidden=n_hidden,
         d_hidden=d_hidden,
         noise_stddev=None if infer_noise_stddev else noise_stddev,
@@ -527,17 +613,17 @@ if __name__ == "__main__":
     )
 
     ## obtain predictions before training
-    mtblr.eval()
+    mtbreg.eval()
     with torch.no_grad():
-        pred_summary_prior_untrained, samples_prior_untrained = predict(
-            model=mtblr, guide=None, x=x_pred, n_samples=n_samples
+        pred_summary_prior_source_untrained, samples_prior_train_untrained = predict(
+            model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
         )
 
     ## print trace shapes
     print("\n********************")
     print("*** Trace shapes ***")
     print("********************")
-    trace = poutine.trace(mtblr).get_trace(x=torch.tensor(x_pred))
+    trace = poutine.trace(mtbreg).get_trace(x=torch.tensor(x_pred_source))
     trace.compute_log_prob()
     print(trace.format_shapes())
     print("********************")
@@ -553,16 +639,19 @@ if __name__ == "__main__":
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    mtblr.train()
+    mtbreg.train()
     # guide = AutoNormal(model=mtblr)
-    guide = AutoDiagonalNormal(model=mtblr)
+    guide_source = AutoDiagonalNormal(model=mtbreg)
     # guide = AutoMultivariateNormal(model=mtblr)
-    svi = SVI(model=mtblr, guide=guide, optim=adam, loss=Trace_ELBO())
-    pyro.clear_param_store()
-    for i in range(n_iter):
-        elbo = svi.step(x=torch.tensor(x), y=torch.tensor(y))
-        if i % 100 == 0:
-            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+    if do_source_training:
+        svi = SVI(
+            model=mtbreg, guide=guide_source, optim=adam_source, loss=Trace_ELBO()
+        )
+        pyro.clear_param_store()
+        for i in range(n_iter_source):
+            elbo = svi.step(x=torch.tensor(x_source), y=torch.tensor(y_source))
+            if i % 100 == 0 or i == len(range(n_iter_source)) - 1:
+                print(f"[iter {i:04d}] elbo = {elbo:.4f}")
     print("*******************************")
 
     ## print learned parameters
@@ -573,26 +662,69 @@ if __name__ == "__main__":
     print("****************************")
 
     ## obtain predictions after training
-    mtblr.eval()
+    mtbreg.eval()
     # obtain prior predictions
-    pred_summary_prior, samples_prior = predict(
-        model=mtblr, guide=None, x=x_pred, n_samples=n_samples
+    pred_summary_prior_source, samples_prior_train = predict(
+        model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
     )
 
     # obtain posterior predictions
-    pred_summary_posterior, samples_posterior = predict(
-        model=mtblr, guide=guide, x=x_pred, n_samples=n_samples
+    pred_summary_posterior_source, samples_posterior_train = predict(
+        model=mtbreg, guide=guide_source, x=x_pred_source, n_samples=n_samples
+    )
+
+    # ## freeze prior
+    mtbreg.freeze_prior()
+
+    # print freezed parameters
+    print("\n**************************************")
+    print("*** Posterior parameters (freezed) ***")
+    print("**************************************")
+    print_parameters()
+    print("**************************************")
+
+    ## do inference on target task
+    print("\n*******************************")
+    print("*** Performing inference... ***")
+    print("*******************************")
+    mtbreg.train()
+    # we need a new guide
+    # guide_test = AutoNormal(model=mtblr)
+    guide_target = AutoDiagonalNormal(model=mtbreg)
+    # guide_test = AutoMultivariateNormal(model=mtblr)
+    pyro.clear_param_store()
+    svi = SVI(model=mtbreg, guide=guide_target, optim=adam_target, loss=Trace_ELBO())
+    for i in range(n_iter_target):
+        elbo = svi.step(x=torch.tensor(x_target), y=torch.tensor(y_target))
+        if i % 100 == 0 or i == len(range(n_iter_target)) - 1:
+            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+    print("*******************************")
+
+    # print freezed parameters
+    print("\n**************************************")
+    print("*** Posterior parameters (freezed) ***")
+    print("**************************************")
+    print_parameters()
+    print("**************************************")
+
+    # obtain posterior predictions
+    pred_summary_posterior_target, samples_posterior_test = predict(
+        model=mtbreg, guide=guide_target, x=x_pred_target, n_samples=n_samples
     )
 
     # plot predictions
     if plot:
         plot_predictions(
-            x_train=x,
-            y_train=y,
-            x_pred=x_pred,
-            pred_summary_prior_untrained=pred_summary_prior_untrained,
-            pred_summary_prior=pred_summary_prior,
-            pred_summary_posterior=pred_summary_posterior,
+            x_source=x_source,
+            y_source=y_source,
+            x_pred_source=x_pred_source,
+            x_target=x_target,
+            y_target=y_target,
+            x_pred_target=x_pred_target,
+            pred_summary_prior_source_untrained=pred_summary_prior_source_untrained,
+            pred_summary_prior_source=pred_summary_prior_source,
+            pred_summary_posterior_source=pred_summary_posterior_source,
+            pred_summary_posterior_target=pred_summary_posterior_target,
             max_tasks=max_plot_tasks,
         )
 
@@ -602,23 +734,24 @@ if __name__ == "__main__":
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 plot_distributions(
-                    site_name="mtbnn.net.weight",
-                    bm=bm,
+                    site_name="mtbnn.net.0.weight",
+                    bm=bm_source,
                     bm_param_idx=0
-                    if isinstance(bm, Linear1D) or isinstance(bm, Affine1D)
+                    if isinstance(bm_source, Linear1D)
+                    or isinstance(bm_source, Affine1D)
                     else None,
-                    samples_prior_untrained=samples_prior_untrained,
-                    samples_prior=samples_prior,
-                    samples_posterior=samples_posterior,
+                    samples_prior_untrained=samples_prior_train_untrained,
+                    samples_prior=samples_prior_train,
+                    samples_posterior=samples_posterior_train,
                 )
 
                 plot_distributions(
-                    site_name="mtbnn.net.bias",
-                    bm=bm,
-                    bm_param_idx=1 if isinstance(bm, Affine1D) else None,
-                    samples_prior_untrained=samples_prior_untrained,
-                    samples_prior=samples_prior,
-                    samples_posterior=samples_posterior,
+                    site_name="mtbnn.net.0.bias",
+                    bm=bm_source,
+                    bm_param_idx=1 if isinstance(bm_source, Affine1D) else None,
+                    samples_prior_untrained=samples_prior_train_untrained,
+                    samples_prior=samples_prior_train,
+                    samples_posterior=samples_posterior_train,
                 )
 
         plt.show()
