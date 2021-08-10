@@ -460,24 +460,26 @@ def plot_predictions(
 
 def plot_distributions(
     site_name,
-    bm,
+    bm_source,
+    bm_target,
     bm_param_idx,
-    samples_prior_untrained,
-    samples_prior,
-    samples_posterior,
+    samples_prior_source_untrained,
+    samples_prior_source,
+    samples_posterior_source,
+    samples_posterior_target,
     max_tasks=3,
 ):
     # TODO: why do we need to squeeze the slope samples?
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6), sharex=True)
+    fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(12, 6), sharex=True)
     fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
 
-    for l, task in enumerate(bm):
+    for l, task in enumerate(bm_source):
         if l == max_tasks:
             break
         ax = axes[0]
-        ax.set_title("Prior distribution (untrained)")
+        ax.set_title("Prior distribution\n(untrained)")
         sns.distplot(
-            samples_prior_untrained[site_name].squeeze()[:, l],
+            samples_prior_source_untrained[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -485,9 +487,9 @@ def plot_distributions(
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
 
         ax = axes[1]
-        ax.set_title("Prior distribution (trained)")
+        ax.set_title("Prior distribution\n(trained on Source)")
         sns.distplot(
-            samples_prior[site_name].squeeze()[:, l],
+            samples_prior_source[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -495,20 +497,36 @@ def plot_distributions(
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
 
         ax = axes[2]
-        ax.set_title("Posterior distribution")
+        ax.set_title("Posterior distribution\n(Source)")
         sns.distplot(
-            samples_posterior[site_name].squeeze()[:, l],
+            samples_posterior_source[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
         if bm_param_idx is not None:
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+
+    ax = axes[3]
+    ax.set_title("Posterior distribution\n(Target)")
+    sns.distplot(
+        samples_posterior_target[site_name].squeeze(),
+        kde_kws={"label": f"Target Task"},
+        ax=ax,
+    )
+    if bm_param_idx is not None:
+        ax.axvline(
+            x=bm_target.get_task_by_index(0).param[bm_param_idx],
+            color=sns.color_palette()[0],
+        )
+
     axes[0].legend()
     axes[1].legend()
     axes[2].legend()
+    axes[3].legend()
     axes[0].set_xlabel(site_name)
     axes[1].set_xlabel(site_name)
     axes[2].set_xlabel(site_name)
+    axes[3].set_xlabel(site_name)
     fig.tight_layout()
 
 
@@ -550,7 +568,7 @@ if __name__ == "__main__":
 
     ## flags, constants
     plot = True
-    smoke_test = True
+    smoke_test = False
     # benchmark
     n_task_source = 8
     n_points_per_task_source = 16
@@ -561,7 +579,7 @@ if __name__ == "__main__":
     infer_noise_stddev = False
     prior = "diagonal"
     # training
-    do_source_training = True 
+    do_source_training = False
     n_iter_source = 5000 if not smoke_test else 1000
     initial_lr_source = 0.1
     gamma_source = 0.00001  # final learning rate will be gamma * initial_lr
@@ -591,7 +609,7 @@ if __name__ == "__main__":
         n_task_source, axis=0
     )
     # target benchmark
-    bm_test = Affine1D(
+    bm_target = Affine1D(
         n_task=1,
         n_datapoints_per_task=n_points_per_task_source,
         output_noise=noise_stddev,
@@ -599,7 +617,7 @@ if __name__ == "__main__":
         seed_x=1236,
         seed_noise=1237,
     )
-    x_target, y_target = collate_data(bm=bm_test)
+    x_target, y_target = collate_data(bm=bm_target)
     x_pred_target = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(1, axis=0)
 
     # create model
@@ -615,7 +633,7 @@ if __name__ == "__main__":
     ## obtain predictions before training
     mtbreg.eval()
     with torch.no_grad():
-        pred_summary_prior_source_untrained, samples_prior_train_untrained = predict(
+        pred_summary_prior_source_untrained, samples_prior_source_untrained = predict(
             model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
         )
 
@@ -664,12 +682,12 @@ if __name__ == "__main__":
     ## obtain predictions after training
     mtbreg.eval()
     # obtain prior predictions
-    pred_summary_prior_source, samples_prior_train = predict(
+    pred_summary_prior_source, samples_prior_source = predict(
         model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
     )
 
     # obtain posterior predictions
-    pred_summary_posterior_source, samples_posterior_train = predict(
+    pred_summary_posterior_source, samples_posterior_source = predict(
         model=mtbreg, guide=guide_source, x=x_pred_source, n_samples=n_samples
     )
 
@@ -708,7 +726,7 @@ if __name__ == "__main__":
     print("**************************************")
 
     # obtain posterior predictions
-    pred_summary_posterior_target, samples_posterior_test = predict(
+    pred_summary_posterior_target, samples_posterior_target = predict(
         model=mtbreg, guide=guide_target, x=x_pred_target, n_samples=n_samples
     )
 
@@ -735,23 +753,27 @@ if __name__ == "__main__":
                 warnings.simplefilter("ignore")
                 plot_distributions(
                     site_name="mtbnn.net.0.weight",
-                    bm=bm_source,
+                    bm_source=bm_source,
+                    bm_target=bm_target,
                     bm_param_idx=0
                     if isinstance(bm_source, Linear1D)
                     or isinstance(bm_source, Affine1D)
                     else None,
-                    samples_prior_untrained=samples_prior_train_untrained,
-                    samples_prior=samples_prior_train,
-                    samples_posterior=samples_posterior_train,
+                    samples_prior_source_untrained=samples_prior_source_untrained,
+                    samples_prior_source=samples_prior_source,
+                    samples_posterior_source=samples_posterior_source,
+                    samples_posterior_target=samples_posterior_target,
                 )
 
                 plot_distributions(
                     site_name="mtbnn.net.0.bias",
-                    bm=bm_source,
+                    bm_source=bm_source,
+                    bm_target=bm_target,
                     bm_param_idx=1 if isinstance(bm_source, Affine1D) else None,
-                    samples_prior_untrained=samples_prior_train_untrained,
-                    samples_prior=samples_prior_train,
-                    samples_posterior=samples_posterior_train,
+                    samples_prior_source_untrained=samples_prior_source_untrained,
+                    samples_prior_source=samples_prior_source,
+                    samples_posterior_source=samples_posterior_source,
+                    samples_posterior_target=samples_posterior_target,
                 )
 
         plt.show()
