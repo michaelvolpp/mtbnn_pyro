@@ -562,7 +562,31 @@ def freeze_parameters():
         pyro.param[name] = pyro.param[name].detach()
 
 
-if __name__ == "__main__":
+def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
+    model.train()
+
+    # optimizer
+    optim_args = {}
+    optim_args["lr"] = initial_lr
+    if final_lr is not None:
+        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+        optim_args["lrd"] = gamma ** (1 / n_iter)
+    optim = ClippedAdam(optim_args=optim_args)
+
+    # SVI
+    svi = SVI(model=model, guide=guide, optim=optim, loss=Trace_ELBO())
+
+    # training loop
+    pyro.clear_param_store()
+    for i in range(n_iter):
+        elbo = svi.step(x=torch.tensor(x), y=torch.tensor(y))
+        if i % 100 == 0 or i == len(range(n_iter)) - 1:
+            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+            
+    model.eval()
+
+
+def main():
     # TODO: sample functions
     # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
     # TODO: implement standard normal regularizer
@@ -580,19 +604,17 @@ if __name__ == "__main__":
     # model
     n_hidden = 1
     d_hidden = 8
-    infer_noise_stddev = False 
+    infer_noise_stddev = False
     prior = "diagonal"
     # training
     do_source_training = True
     n_iter_source = 5000 if not smoke_test else 1000
     initial_lr_source = 0.1
-    gamma_source = 0.00001  # final learning rate will be gamma * initial_lr
-    lrd_source = gamma_source ** (1 / n_iter_source)
-    adam_source = ClippedAdam({"lr": initial_lr_source, "lrd": lrd_source})
+    final_lr_source = 0.000001  # final learning rate will be gamma * initial_lr
     # adaptation
     n_iter_target = 250
-    lr_target = 0.01
-    adam_target = ClippedAdam({"lr": lr_target})
+    initial_lr_target = 0.01
+    final_lr_target = None
     # evaluation
     n_pred = 100
     n_samples = 1000
@@ -633,9 +655,9 @@ if __name__ == "__main__":
         noise_stddev=None if infer_noise_stddev else noise_stddev,
         prior_type=prior,
     )
+    mtbreg.eval()
 
     ## obtain predictions before training
-    mtbreg.eval()
     with torch.no_grad():
         pred_summary_prior_source_untrained, samples_prior_source_untrained = predict(
             model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
@@ -661,19 +683,19 @@ if __name__ == "__main__":
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    mtbreg.train()
     # guide = AutoNormal(model=mtblr)
     guide_source = AutoDiagonalNormal(model=mtbreg)
     # guide = AutoMultivariateNormal(model=mtblr)
     if do_source_training:
-        svi = SVI(
-            model=mtbreg, guide=guide_source, optim=adam_source, loss=Trace_ELBO()
+        train_model(
+            model=mtbreg,
+            guide=guide_source,
+            x=x_source,
+            y=y_source,
+            n_iter=n_iter_source,
+            initial_lr=initial_lr_source,
+            final_lr=final_lr_source,
         )
-        pyro.clear_param_store()
-        for i in range(n_iter_source):
-            elbo = svi.step(x=torch.tensor(x_source), y=torch.tensor(y_source))
-            if i % 100 == 0 or i == len(range(n_iter_source)) - 1:
-                print(f"[iter {i:04d}] elbo = {elbo:.4f}")
     print("*******************************")
 
     ## print learned parameters
@@ -684,12 +706,10 @@ if __name__ == "__main__":
     print("****************************")
 
     ## obtain predictions after training
-    mtbreg.eval()
     # obtain prior predictions
     pred_summary_prior_source, samples_prior_source = predict(
         model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
     )
-
     # obtain posterior predictions
     pred_summary_posterior_source, samples_posterior_source = predict(
         model=mtbreg, guide=guide_source, x=x_pred_source, n_samples=n_samples
@@ -709,17 +729,19 @@ if __name__ == "__main__":
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    mtbreg.train()
     # we need a new guide
     # guide_test = AutoNormal(model=mtblr)
     guide_target = AutoDiagonalNormal(model=mtbreg)
     # guide_test = AutoMultivariateNormal(model=mtblr)
-    pyro.clear_param_store()
-    svi = SVI(model=mtbreg, guide=guide_target, optim=adam_target, loss=Trace_ELBO())
-    for i in range(n_iter_target):
-        elbo = svi.step(x=torch.tensor(x_target), y=torch.tensor(y_target))
-        if i % 100 == 0 or i == len(range(n_iter_target)) - 1:
-            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+    train_model(
+        model=mtbreg,
+        guide=guide_target,
+        x=x_target,
+        y=y_target,
+        n_iter=n_iter_target,
+        initial_lr=initial_lr_target,
+        final_lr=final_lr_target,
+    )
     print("*******************************")
 
     # print freezed parameters
@@ -781,3 +803,7 @@ if __name__ == "__main__":
                 )
 
         plt.show()
+
+
+if __name__ == "__main__":
+    main()
