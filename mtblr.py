@@ -103,6 +103,8 @@ class MTBayesianLinear(PyroModule):
             else:
                 raise ValueError(f"Unknown prior specification '{prior_type}'!")
             self.bias = PyroSample(self.bias_prior)
+        else:
+            self.bias = None
 
     def forward(self, x):
         # check shapes
@@ -112,13 +114,15 @@ class MTBayesianLinear(PyroModule):
         # self.weight.batch_shape = (n_tasks, 1)
         # self.weight.event_shape = (self.out_features, self.in_features)
         assert self.weight.shape == (n_tasks, 1, self.out_features, self.in_features)
-        # self.bias.batch_shape = (n_tasks, 1)
-        # self.bias.event_shape = (self.out_features)
-        assert self.bias.shape == (n_tasks, 1, self.out_features)
-
         # TODO: why do we need x.float() here as soon as we have more than zero layers?
         y = torch.einsum("lyx,lnx->lny", self.weight.squeeze(1), x.float())
-        y = y + self.bias.squeeze(1)[:, None, :]
+
+        if self.bias is not None:
+            # self.bias.batch_shape = (n_tasks, 1)
+            # self.bias.event_shape = (self.out_features)
+            assert self.bias.shape == (n_tasks, 1, self.out_features)
+            y = y + self.bias.squeeze(1)[:, None, :]
+
         return y
 
     # def freeze_prior(self):
@@ -188,7 +192,7 @@ class MTBNN(PyroModule):
 
     def freeze_prior(self):
         # freeze the unconstrained parameters
-        # -> those are the leave variables of the autograd graph
+        # -> those are the leaf variables of the autograd graph
         # -> those are the registered parameters of self
         for p in self.parameters():
             p.requires_grad = False
@@ -559,9 +563,9 @@ def freeze_parameters():
 
 
 if __name__ == "__main__":
-    # TODO: implement adaptation
     # TODO: sample functions
     # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
+    # TODO: implement standard normal regularizer
 
     # seed
     pyro.set_rng_seed(123)
@@ -574,12 +578,12 @@ if __name__ == "__main__":
     n_points_per_task_source = 16
     noise_stddev = 0.01
     # model
-    n_hidden = 0
+    n_hidden = 1
     d_hidden = 8
-    infer_noise_stddev = False
+    infer_noise_stddev = False 
     prior = "diagonal"
     # training
-    do_source_training = False
+    do_source_training = True
     n_iter_source = 5000 if not smoke_test else 1000
     initial_lr_source = 0.1
     gamma_source = 0.00001  # final learning rate will be gamma * initial_lr

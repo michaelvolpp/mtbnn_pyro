@@ -281,9 +281,9 @@ if __name__ == "__main__":
     # TODO: try MultivariateNormal guide -> correlations between different z samples
     ## constants
     pyro.set_rng_seed(1236)
-    smoke_test = False
+    smoke_test = False 
     # data
-    N = 1000
+    N = 100
     noise_stddev = 0.01
     # architecture
     d_z = 2
@@ -299,11 +299,13 @@ if __name__ == "__main__":
     n_samples_pred = 100 if not smoke_test else 1
 
     # data
-    x = torch.tensor(
-        generate_spiral_data(
-            n_points=N, noise_stddev=noise_stddev, spiral=True, angle_high=3 * np.pi
-        )
+    x = generate_spiral_data(
+        n_points=N, noise_stddev=noise_stddev, spiral=False, angle_high=1 * np.pi
     )
+    # x = generate_spiral_data(
+    #     n_points=N, noise_stddev=noise_stddev, spiral=True, angle_high=3 * np.pi
+    # )
+    x = torch.tensor(x)
 
     # perform inference
     vae = VAE(d_x=2, d_z=d_z, n_hidden=n_hidden, d_hidden=d_hidden, noise_stddev=None)
