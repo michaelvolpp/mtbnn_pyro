@@ -340,19 +340,19 @@ def plot_one_prediction(
 
 
 def plot_predictions(
-    x_source,
-    y_source,
-    x_pred_source,
-    x_target,
-    y_target,
-    x_pred_target,
-    pred_summary_prior_source_untrained,
-    pred_summary_prior_source,
-    pred_summary_posterior_source,
-    pred_summary_posterior_target,
+    x_meta,
+    y_meta,
+    x_pred_meta,
+    x_test,
+    y_test,
+    x_pred_test,
+    pred_summary_prior_meta_untrained,
+    pred_summary_prior_meta_trained,
+    pred_summary_posterior_meta,
+    pred_summary_posterior_test,
     max_tasks=3,
 ):
-    assert x_source.shape[-1] == y_source.shape[-1] == x_pred_source.shape[-1]
+    assert x_meta.shape[-1] == y_meta.shape[-1] == x_pred_meta.shape[-1]
 
     fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(12, 6), sharey=True)
     fig.suptitle(f"Prior and Posterior Predictions")
@@ -360,12 +360,12 @@ def plot_predictions(
     ax = axes[0, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Mean\n+ Source Data")
+    ax.set_title("Prior Mean + Meta Data")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_prior_source_untrained,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_prior_meta_untrained,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -374,12 +374,12 @@ def plot_predictions(
     ax = axes[0, 1]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Mean\n(trained on Source Data)")
+    ax.set_title("Prior Mean\n(trained on meta data)")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_prior_source,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_prior_meta_trained,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -388,12 +388,12 @@ def plot_predictions(
     ax = axes[0, 2]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Mean\n(Source)")
+    ax.set_title("Posterior Mean\n(meta data)")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_posterior_source,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_posterior_meta,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -402,12 +402,12 @@ def plot_predictions(
     ax = axes[0, 3]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Mean\n(Target)")
+    ax.set_title("Posterior Mean\n(Test)")
     plot_one_prediction(
-        x=x_target,
-        y=y_target,
-        x_pred=x_pred_target,
-        pred_summary=pred_summary_posterior_target,
+        x=x_test,
+        y=y_test,
+        x_pred=x_pred_test,
+        pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=False,
         max_tasks=max_tasks,
@@ -416,12 +416,12 @@ def plot_predictions(
     ax = axes[1, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Observation\n+ Source Data")
+    ax.set_title("Prior Observation + Meta Data")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_prior_source_untrained,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_prior_meta_untrained,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -430,12 +430,12 @@ def plot_predictions(
     ax = axes[1, 1]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Observation\n(trained on Source Data)")
+    ax.set_title("Prior Observation\n(trained on meta data)")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_prior_source,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_prior_meta_trained,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -444,12 +444,12 @@ def plot_predictions(
     ax = axes[1, 2]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Observation\n(Source)")
+    ax.set_title("Posterior Observation\n(meta data)")
     plot_one_prediction(
-        x=x_source,
-        y=y_source,
-        x_pred=x_pred_source,
-        pred_summary=pred_summary_posterior_source,
+        x=x_meta,
+        y=y_meta,
+        x_pred=x_pred_meta,
+        pred_summary=pred_summary_posterior_meta,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -458,12 +458,12 @@ def plot_predictions(
     ax = axes[1, 3]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Observation\n(Target)")
+    ax.set_title("Posterior Observation\n(test data)")
     plot_one_prediction(
-        x=x_target,
-        y=y_target,
-        x_pred=x_pred_target,
-        pred_summary=pred_summary_posterior_target,
+        x=x_test,
+        y=y_test,
+        x_pred=x_pred_test,
+        pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=True,
         max_tasks=max_tasks,
@@ -473,26 +473,26 @@ def plot_predictions(
 
 def plot_distributions(
     site_name,
-    bm_source,
-    bm_target,
+    bm_meta,
+    bm_test,
     bm_param_idx,
-    samples_prior_source_untrained,
-    samples_prior_source,
-    samples_posterior_source,
-    samples_posterior_target,
+    samples_prior_meta_untrained,
+    samples_prior_meta_trained,
+    samples_posterior_meta,
+    samples_posterior_test,
     max_tasks=3,
 ):
     # TODO: why do we need to squeeze the slope samples?
     fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(12, 6), sharex=True)
     fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
 
-    for l, task in enumerate(bm_source):
+    for l, task in enumerate(bm_meta):
         if l == max_tasks:
             break
         ax = axes[0]
         ax.set_title("Prior distribution\n(untrained)")
         sns.distplot(
-            samples_prior_source_untrained[site_name].squeeze()[:, l],
+            samples_prior_meta_untrained[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -500,9 +500,9 @@ def plot_distributions(
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
 
         ax = axes[1]
-        ax.set_title("Prior distribution\n(trained on Source)")
+        ax.set_title("Prior distribution\n(trained on meta data)")
         sns.distplot(
-            samples_prior_source[site_name].squeeze()[:, l],
+            samples_prior_meta_trained[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -510,9 +510,9 @@ def plot_distributions(
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
 
         ax = axes[2]
-        ax.set_title("Posterior distribution\n(Source)")
+        ax.set_title("Posterior distribution\n(meta data)")
         sns.distplot(
-            samples_posterior_source[site_name].squeeze()[:, l],
+            samples_posterior_meta[site_name].squeeze()[:, l],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -520,15 +520,15 @@ def plot_distributions(
             ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
 
     ax = axes[3]
-    ax.set_title("Posterior distribution\n(Target)")
+    ax.set_title("Posterior distribution\n(test data)")
     sns.distplot(
-        samples_posterior_target[site_name].squeeze(),
-        kde_kws={"label": f"Target Task"},
+        samples_posterior_test[site_name].squeeze(),
+        kde_kws={"label": f"Test Task"},
         ax=ax,
     )
     if bm_param_idx is not None:
         ax.axvline(
-            x=bm_target.get_task_by_index(0).param[bm_param_idx],
+            x=bm_test.get_task_by_index(0).param[bm_param_idx],
             color=sns.color_palette()[0],
         )
 
@@ -657,67 +657,66 @@ def main():
     # TODO: sample functions
     # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
     # TODO: implement more complex priors (e.g., not factorized across layers?)
-    # TODO: implement standard normal regularizer
 
     ## flags, constants
     pyro.set_rng_seed(123)
     plot = True
-    smoke_test = False
+    smoke_test = True 
     # benchmark
     bm = Quadratic1D
-    n_task_source = 8
-    n_points_per_task_source = 16
+    n_task_meta = 8
+    n_points_per_task_meta = 16
     noise_stddev = 0.01
     # model
-    n_hidden = 1
+    n_hidden = 0
     d_hidden = 8
     infer_noise_stddev = True
     prior_type = "diagonal"
-    # training
-    do_source_training = True 
-    n_iter_source = 5000 if not smoke_test else 1000
-    initial_lr_source = 0.1
-    final_lr_source = 0.00001
-    alpha_reg_source = 0.0
+    # meta training
+    do_meta_training = True 
+    n_iter_meta = 5000 if not smoke_test else 1000
+    initial_lr_meta = 0.1
+    final_lr_meta = 0.00001
+    alpha_reg_meta = 0.0
     # adaptation
-    n_iter_target = 250
-    initial_lr_target = 0.01
-    final_lr_target = None
+    n_iter_test = 250
+    initial_lr_test = 0.01
+    final_lr_test = None
     # evaluation
     n_pred = 100
     n_samples = 1000
     max_plot_tasks = 5
 
     ## create benchmarks
-    # source benchmark
-    bm_source = bm(
-        n_task=n_task_source,
-        n_datapoints_per_task=n_points_per_task_source,
+    # meta benchmark
+    bm_meta = bm(
+        n_task=n_task_meta,
+        n_datapoints_per_task=n_points_per_task_meta,
         output_noise=noise_stddev,
         seed_task=1234,
         seed_x=1235,
         seed_noise=1236,
     )
-    x_source, y_source = collate_data(bm=bm_source)
-    x_pred_source = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(
-        n_task_source, axis=0
+    x_meta, y_meta = collate_data(bm=bm_meta)
+    x_pred_meta = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(
+        n_task_meta, axis=0
     )
-    # target benchmark
-    bm_target = bm(
+    # test benchmark
+    bm_test = bm(
         n_task=1,
-        n_datapoints_per_task=n_points_per_task_source,
+        n_datapoints_per_task=n_points_per_task_meta,
         output_noise=noise_stddev,
         seed_task=1235,
         seed_x=1236,
         seed_noise=1237,
     )
-    x_target, y_target = collate_data(bm=bm_target)
-    x_pred_target = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(1, axis=0)
+    x_test, y_test = collate_data(bm=bm_test)
+    x_pred_test = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(1, axis=0)
 
     # create model
     mtbreg = MTBayesianRegression(
-        d_x=bm_source.d_x,
-        d_y=bm_source.d_y,
+        d_x=bm_meta.d_x,
+        d_y=bm_meta.d_y,
         n_hidden=n_hidden,
         d_hidden=d_hidden,
         noise_stddev=None if infer_noise_stddev else noise_stddev,
@@ -727,17 +726,17 @@ def main():
 
     prior_type = mtbreg.get_prior_distribution()
 
-    ## obtain predictions before training
+    ## obtain predictions before meta training
     with torch.no_grad():
-        pred_summary_prior_source_untrained, samples_prior_source_untrained = predict(
-            model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
+        pred_summary_prior_meta_untrained, samples_prior_meta_untrained = predict(
+            model=mtbreg, guide=None, x=x_pred_meta, n_samples=n_samples
         )
 
     ## print trace shapes
     print("\n********************")
     print("*** Trace shapes ***")
     print("********************")
-    trace = poutine.trace(mtbreg).get_trace(x=torch.tensor(x_pred_source))
+    trace = poutine.trace(mtbreg).get_trace(x=torch.tensor(x_pred_meta))
     trace.compute_log_prob()
     print(trace.format_shapes())
     print("********************")
@@ -754,18 +753,18 @@ def main():
     print("*** Performing inference... ***")
     print("*******************************")
     # guide = AutoNormal(model=mtblr)
-    guide_source = AutoDiagonalNormal(model=mtbreg)
+    guide_meta = AutoDiagonalNormal(model=mtbreg)
     # guide = AutoMultivariateNormal(model=mtblr)
-    if do_source_training:
+    if do_meta_training:
         train_model_custom_loss(
             model=mtbreg,
-            guide=guide_source,
-            x=x_source,
-            y=y_source,
-            n_iter=n_iter_source,
-            initial_lr=initial_lr_source,
-            final_lr=final_lr_source,
-            alpha_reg=alpha_reg_source,
+            guide=guide_meta,
+            x=x_meta,
+            y=y_meta,
+            n_iter=n_iter_meta,
+            initial_lr=initial_lr_meta,
+            final_lr=final_lr_meta,
+            alpha_reg=alpha_reg_meta,
         )
     print("*******************************")
 
@@ -776,14 +775,14 @@ def main():
     print_parameters()
     print("****************************")
 
-    ## obtain predictions after training
+    ## obtain predictions after meta training
     # obtain prior predictions
-    pred_summary_prior_source, samples_prior_source = predict(
-        model=mtbreg, guide=None, x=x_pred_source, n_samples=n_samples
+    pred_summary_prior_meta_trained, samples_prior_meta_trained = predict(
+        model=mtbreg, guide=None, x=x_pred_meta, n_samples=n_samples
     )
     # obtain posterior predictions
-    pred_summary_posterior_source, samples_posterior_source = predict(
-        model=mtbreg, guide=guide_source, x=x_pred_source, n_samples=n_samples
+    pred_summary_posterior_meta, samples_posterior_meta = predict(
+        model=mtbreg, guide=guide_meta, x=x_pred_meta, n_samples=n_samples
     )
 
     # ## freeze prior
@@ -796,22 +795,22 @@ def main():
     print_parameters()
     print("**************************************")
 
-    ## do inference on target task
+    ## do inference on test task
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
     # we need a new guide
     # guide_test = AutoNormal(model=mtblr)
-    guide_target = AutoDiagonalNormal(model=mtbreg)
+    guide_test = AutoDiagonalNormal(model=mtbreg)
     # guide_test = AutoMultivariateNormal(model=mtblr)
     train_model(
         model=mtbreg,
-        guide=guide_target,
-        x=x_target,
-        y=y_target,
-        n_iter=n_iter_target,
-        initial_lr=initial_lr_target,
-        final_lr=final_lr_target,
+        guide=guide_test,
+        x=x_test,
+        y=y_test,
+        n_iter=n_iter_test,
+        initial_lr=initial_lr_test,
+        final_lr=final_lr_test,
     )
     print("*******************************")
 
@@ -823,23 +822,23 @@ def main():
     print("**************************************")
 
     # obtain posterior predictions
-    pred_summary_posterior_target, samples_posterior_target = predict(
-        model=mtbreg, guide=guide_target, x=x_pred_target, n_samples=n_samples
+    pred_summary_posterior_test, samples_posterior_test = predict(
+        model=mtbreg, guide=guide_test, x=x_pred_test, n_samples=n_samples
     )
 
     # plot predictions
     if plot:
         plot_predictions(
-            x_source=x_source,
-            y_source=y_source,
-            x_pred_source=x_pred_source,
-            x_target=x_target,
-            y_target=y_target,
-            x_pred_target=x_pred_target,
-            pred_summary_prior_source_untrained=pred_summary_prior_source_untrained,
-            pred_summary_prior_source=pred_summary_prior_source,
-            pred_summary_posterior_source=pred_summary_posterior_source,
-            pred_summary_posterior_target=pred_summary_posterior_target,
+            x_meta=x_meta,
+            y_meta=y_meta,
+            x_pred_meta=x_pred_meta,
+            x_test=x_test,
+            y_test=y_test,
+            x_pred_test=x_pred_test,
+            pred_summary_prior_meta_untrained=pred_summary_prior_meta_untrained,
+            pred_summary_prior_meta_trained=pred_summary_prior_meta_trained,
+            pred_summary_posterior_meta=pred_summary_posterior_meta,
+            pred_summary_posterior_test=pred_summary_posterior_test,
             max_tasks=max_plot_tasks,
         )
 
@@ -850,27 +849,27 @@ def main():
                 warnings.simplefilter("ignore")
                 plot_distributions(
                     site_name="mtbnn.net.0.weight",
-                    bm_source=bm_source,
-                    bm_target=bm_target,
+                    bm_meta=bm_meta,
+                    bm_test=bm_test,
                     bm_param_idx=0
-                    if isinstance(bm_source, Linear1D)
-                    or isinstance(bm_source, Affine1D)
+                    if isinstance(bm_meta, Linear1D)
+                    or isinstance(bm_meta, Affine1D)
                     else None,
-                    samples_prior_source_untrained=samples_prior_source_untrained,
-                    samples_prior_source=samples_prior_source,
-                    samples_posterior_source=samples_posterior_source,
-                    samples_posterior_target=samples_posterior_target,
+                    samples_prior_meta_untrained=samples_prior_meta_untrained,
+                    samples_prior_meta_trained=samples_prior_meta_trained,
+                    samples_posterior_meta=samples_posterior_meta,
+                    samples_posterior_test=samples_posterior_test,
                 )
 
                 plot_distributions(
                     site_name="mtbnn.net.0.bias",
-                    bm_source=bm_source,
-                    bm_target=bm_target,
-                    bm_param_idx=1 if isinstance(bm_source, Affine1D) else None,
-                    samples_prior_source_untrained=samples_prior_source_untrained,
-                    samples_prior_source=samples_prior_source,
-                    samples_posterior_source=samples_posterior_source,
-                    samples_posterior_target=samples_posterior_target,
+                    bm_meta=bm_meta,
+                    bm_test=bm_test,
+                    bm_param_idx=1 if isinstance(bm_meta, Affine1D) else None,
+                    samples_prior_meta_untrained=samples_prior_meta_untrained,
+                    samples_prior_meta_trained=samples_prior_meta_trained,
+                    samples_posterior_meta=samples_posterior_meta,
+                    samples_posterior_test=samples_posterior_test,
                 )
 
         plt.show()
