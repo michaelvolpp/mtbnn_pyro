@@ -15,10 +15,14 @@ from pyro import distributions as dist
 from pyro import poutine
 from pyro.distributions import constraints
 from pyro.infer import SVI, Predictive, Trace_ELBO, TraceEnum_ELBO
-from pyro.infer.autoguide import AutoDiagonalNormal, AutoNormal, AutoMultivariateNormal
+from pyro.infer.autoguide import AutoDiagonalNormal, AutoMultivariateNormal, AutoNormal
 from pyro.nn import PyroModule, PyroParam, PyroSample
-from pyro.optim import Adam, ClippedAdam
+from pyro.optim import ClippedAdam
 from torch import nn
+from torch.distributions.kl import kl_divergence
+from torch.nn.utils import clip_grad_norm_
+from torch.optim import Adam as AdamTorch
+from torch.optim.lr_scheduler import ExponentialLR
 
 ### PyroNotes:
 ## Learned PyroParams
@@ -40,9 +44,10 @@ class MTBayesianLinear(PyroModule):
 
         self.in_features = in_features
         self.out_features = out_features
+        self.prior_type = prior_type
 
         ## weight prior
-        if prior_type == "isotropic":
+        if self.prior_type == "isotropic":
             self.weight_prior_loc = PyroParam(
                 init_value=torch.tensor(0.0),
                 constraint=constraints.real,
@@ -56,7 +61,7 @@ class MTBayesianLinear(PyroModule):
                 .expand([self.out_features, self.in_features])
                 .to_event(2)
             )
-        elif prior_type == "diagonal":
+        elif self.prior_type == "diagonal":
             self.weight_prior_loc = PyroParam(
                 init_value=torch.zeros(self.out_features, self.in_features),
                 constraint=constraints.real,
@@ -69,12 +74,12 @@ class MTBayesianLinear(PyroModule):
                 self.weight_prior_loc, self.weight_prior_scale
             ).to_event(2)
         else:
-            raise ValueError(f"Unknown prior specification '{prior_type}'!")
+            raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
         self.weight = PyroSample(self.weight_prior)
 
         ## bias prior
         if bias:
-            if prior_type == "isotropic":
+            if self.prior_type == "isotropic":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.tensor(0.0),
                     constraint=constraints.real,
@@ -88,7 +93,7 @@ class MTBayesianLinear(PyroModule):
                     .expand([self.out_features])
                     .to_event(1)
                 )
-            elif prior_type == "diagonal":
+            elif self.prior_type == "diagonal":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.zeros(self.out_features),
                     constraint=constraints.real,
@@ -101,7 +106,7 @@ class MTBayesianLinear(PyroModule):
                     self.bias_prior_loc, self.bias_prior_scale
                 ).to_event(1)
             else:
-                raise ValueError(f"Unknown prior specification '{prior_type}'!")
+                raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
             self.bias = PyroSample(self.bias_prior)
         else:
             self.bias = None
@@ -125,14 +130,8 @@ class MTBayesianLinear(PyroModule):
 
         return y
 
-    # def freeze_prior(self):
-    #     # freeze the unconstrained parameters
-    #     # -> those are the leave variables of the autograd graph
-    #     # -> those are the registered parameters of self
-    #     self.weight_prior_loc_unconstrained.requires_grad = False
-    #     self.weight_prior_scale_unconstrained.requires_grad = False
-    #     self.bias_prior_loc_unconstrained.requires_grad = False
-    #     self.bias_prior_scale_unconstrained.requires_grad = False
+    def get_prior_distribution(self):
+        return [self.weight_prior(self), self.bias_prior(self)]
 
 
 class MTBNN(PyroModule):
@@ -197,6 +196,13 @@ class MTBNN(PyroModule):
         for p in self.parameters():
             p.requires_grad = False
 
+    def get_prior_distribution(self):
+        prior_distribution = []
+        for module in self.net:
+            if hasattr(module, "get_prior_distribution"):
+                prior_distribution += module.get_prior_distribution()
+        return prior_distribution
+
 
 class MTBayesianRegression(PyroModule):
     def __init__(
@@ -249,6 +255,9 @@ class MTBayesianRegression(PyroModule):
 
     def freeze_prior(self):
         self.mtbnn.freeze_prior()
+
+    def get_prior_distribution(self):
+        return self.mtbnn.get_prior_distribution()
 
 
 def predict(model, guide, x: np.ndarray, n_samples: int):
@@ -562,6 +571,21 @@ def freeze_parameters():
         pyro.param[name] = pyro.param[name].detach()
 
 
+def compute_regularizer(model):
+    prior = model.get_prior_distribution()
+    regularizer = torch.tensor(0.0)
+    for prior_factor in prior:
+        assert len(prior_factor.batch_shape) == 0
+        normal = (
+            dist.Normal(0.0, 1.0)
+            .expand(prior_factor.event_shape)
+            .to_event(len(prior_factor.event_shape))
+        )
+        kl = kl_divergence(prior_factor, normal)
+        regularizer = regularizer + kl
+    return regularizer
+
+
 def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
     model.train()
 
@@ -582,35 +606,79 @@ def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
         elbo = svi.step(x=torch.tensor(x), y=torch.tensor(y))
         if i % 100 == 0 or i == len(range(n_iter)) - 1:
             print(f"[iter {i:04d}] elbo = {elbo:.4f}")
-            
+
+    model.eval()
+
+
+def train_model_custom_loss(
+    model, guide, x, y, n_iter, initial_lr, alpha_reg, final_lr=None
+):
+    model.train()
+
+    # get parameters
+    params_model = list(model.parameters())
+    guide(x=torch.tensor(x), y=torch.tensor(y))
+    params_guide = list(guide.parameters())
+    params = params_model + params_guide
+
+    ## optimizer
+    # use the same tweaks as Pyro's ClippedAdam: LR decay and gradient clipping
+    # (gradient clipping is implemented in the training loop itself)
+    optim = AdamTorch(params=params, lr=initial_lr)
+    if final_lr is not None:
+        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+        lr_decay = gamma ** (1 / n_iter)
+        lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
+    else:
+        lr_scheduler = None
+
+    # loss
+    regularizer_fn = compute_regularizer
+    elbo_fn = Trace_ELBO().differentiable_loss
+
+    # training loop
+    for i in range(n_iter):
+        optim.zero_grad()
+        regularizer = regularizer_fn(model=model)
+        elbo = elbo_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
+        loss = elbo + alpha_reg * regularizer
+        loss.backward()
+        clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
+        optim.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        if i % 100 == 0 or i == len(range(n_iter)) - 1:
+            print(f"[iter {i:04d}] elbo = {elbo:.4e} | reg = {regularizer:.4e}")
+
     model.eval()
 
 
 def main():
     # TODO: sample functions
     # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
+    # TODO: implement more complex priors (e.g., not factorized across layers?)
     # TODO: implement standard normal regularizer
 
-    # seed
-    pyro.set_rng_seed(123)
-
     ## flags, constants
+    pyro.set_rng_seed(123)
     plot = True
     smoke_test = False
     # benchmark
+    bm = Quadratic1D
     n_task_source = 8
     n_points_per_task_source = 16
     noise_stddev = 0.01
     # model
     n_hidden = 1
     d_hidden = 8
-    infer_noise_stddev = False
-    prior = "diagonal"
+    infer_noise_stddev = True
+    prior_type = "diagonal"
     # training
-    do_source_training = True
+    do_source_training = True 
     n_iter_source = 5000 if not smoke_test else 1000
     initial_lr_source = 0.1
-    final_lr_source = 0.000001  # final learning rate will be gamma * initial_lr
+    final_lr_source = 0.00001
+    alpha_reg_source = 0.0
     # adaptation
     n_iter_target = 250
     initial_lr_target = 0.01
@@ -622,7 +690,7 @@ def main():
 
     ## create benchmarks
     # source benchmark
-    bm_source = Affine1D(
+    bm_source = bm(
         n_task=n_task_source,
         n_datapoints_per_task=n_points_per_task_source,
         output_noise=noise_stddev,
@@ -635,7 +703,7 @@ def main():
         n_task_source, axis=0
     )
     # target benchmark
-    bm_target = Affine1D(
+    bm_target = bm(
         n_task=1,
         n_datapoints_per_task=n_points_per_task_source,
         output_noise=noise_stddev,
@@ -653,9 +721,11 @@ def main():
         n_hidden=n_hidden,
         d_hidden=d_hidden,
         noise_stddev=None if infer_noise_stddev else noise_stddev,
-        prior_type=prior,
+        prior_type=prior_type,
     )
     mtbreg.eval()
+
+    prior_type = mtbreg.get_prior_distribution()
 
     ## obtain predictions before training
     with torch.no_grad():
@@ -687,7 +757,7 @@ def main():
     guide_source = AutoDiagonalNormal(model=mtbreg)
     # guide = AutoMultivariateNormal(model=mtblr)
     if do_source_training:
-        train_model(
+        train_model_custom_loss(
             model=mtbreg,
             guide=guide_source,
             x=x_source,
@@ -695,6 +765,7 @@ def main():
             n_iter=n_iter_source,
             initial_lr=initial_lr_source,
             final_lr=final_lr_source,
+            alpha_reg=alpha_reg_source,
         )
     print("*******************************")
 
