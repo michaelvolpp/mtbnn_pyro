@@ -112,21 +112,63 @@ class MTBayesianLinear(PyroModule):
             self.bias = None
 
     def forward(self, x):
-        # check shapes
+        x = x.detach().clone()
+        weight = self.weight.detach().clone()
+        bias = self.bias.detach().clone()
+
+        ## check shapes
         # x.shape = (n_tasks, n_points, d_x)
         assert x.ndim == 3
         n_tasks = x.shape[0]
-        # self.weight.batch_shape = (n_tasks, 1)
-        # self.weight.event_shape = (self.out_features, self.in_features)
-        assert self.weight.shape == (n_tasks, 1, self.out_features, self.in_features)
-        # TODO: why do we need x.float() here as soon as we have more than zero layers?
-        y = torch.einsum("lyx,lnx->lny", self.weight.squeeze(1), x.float())
 
-        if self.bias is not None:
-            # self.bias.batch_shape = (n_tasks, 1)
-            # self.bias.event_shape = (self.out_features)
-            assert self.bias.shape == (n_tasks, 1, self.out_features)
-            y = y + self.bias.squeeze(1)[:, None, :]
+        # weight.event_shape == (self.out_features, self.in_features)
+        # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
+        #  by Predictive)
+        has_sample_shape = len(weight.shape) == 5
+        if not has_sample_shape:
+            n_samples = 1
+            assert weight.shape == (
+                n_tasks,
+                1,  # this is due to the n_pts plate being nested inside of the n_tsk plate
+                self.out_features,
+                self.in_features,
+            )
+            # add sample dim
+            weight = weight[None, :, :, :, :]
+        else:
+            n_samples = weight.shape[0]
+        # squeeze n_pts batch dimension
+        weight = weight.squeeze(2)
+        assert weight.shape == (
+            n_samples,
+            n_tasks,
+            self.out_features,
+            self.in_features,
+        )
+
+        # expand x to sample shape
+        x = x.expand(torch.Size([n_samples]) + x.shape)
+
+        ## compute the linear transformation
+        # TODO: why do we need x.float() here as soon as we have more than zero layers?
+        y = torch.einsum("slyx,slnx->slny", weight, x.float())
+
+        if bias is not None:
+            ## check shapes
+            # bias.event_shape = (self.out_features)
+            # bias.batch_shape = (n_tasks, 1) or (n_samples, n_tasks, 1) (cf. above)
+            if has_sample_shape:
+                assert bias.shape == (n_samples, n_tasks, 1, self.out_features)
+            else:
+                assert bias.shape == (n_tasks, 1, self.out_features)
+                # add sample dim
+                bias = bias[None, :, :, :]
+            # squeeze the n_pts batch dimension
+            bias = bias.squeeze(2)
+            assert bias.shape == (n_samples, n_tasks, self.out_features)
+
+            ## add the bias
+            y = y + bias[:, :, None, :]
 
         return y
 
@@ -247,6 +289,9 @@ class MTBayesianRegression(PyroModule):
         noise_stddev = self.noise_stddev  # (sample) noise stddev
         with pyro.plate("tasks", n_tasks, dim=-2):
             mean = self.mtbnn(x)  # sample weights and compute mean pred
+            # noise stddev can have a sample dimension! -> expand to mean's shape
+            noise_stddev = noise_stddev.reshape([-1] + [1] * (mean.ndim - 1))
+            noise_stddev = noise_stddev.expand(mean.shape)
             with pyro.plate("data", n_points, dim=-1):
                 obs = pyro.sample(
                     "obs", dist.Normal(mean, noise_stddev).to_event(1), obs=y
@@ -265,6 +310,7 @@ def predict(model, guide, x: np.ndarray, n_samples: int):
         model=model,
         guide=guide,
         num_samples=n_samples,
+        parallel=True,  # our model is vectorized
         return_sites=(
             # if model is linear, those sites are available
             "mtbnn.net.0.weight",
@@ -294,7 +340,7 @@ def summary(samples):
     return site_stats
 
 
-def plot_one_prediction(
+def plot_predictions_for_one_set_of_tasks(
     x: np.ndarray,
     y: np.ndarray,
     x_pred: np.ndarray,
@@ -302,6 +348,8 @@ def plot_one_prediction(
     plot_obs: bool,
     ax: None,
     max_tasks: int,
+    x_context: Optional[np.ndarray] = None,
+    y_context: Optional[np.ndarray] = None,
 ):
     if ax is None:
         fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12, 6))
@@ -318,15 +366,23 @@ def plot_one_prediction(
     for l in range(n_task):
         if l == max_tasks:
             break
-        base_line = ax.plot(x_pred[l, :], means_plt[l, :])[0]
-        ax.scatter(x[l, :], y[l, :], color=base_line.get_color())
+        line = ax.plot(x_pred[l, :], means_plt[l, :])[0]
+        ax.scatter(x[l, :], y[l, :], color=line.get_color())
+        if x_context is not None:
+            ax.scatter(
+                x_context[l, :],
+                y_context[l, :],
+                marker="x",
+                s=100,
+                color=line.get_color(),
+            )
         if not plot_obs:
             ax.fill_between(
                 x_pred[l, :],
                 means_perc5_plt[l, :],
                 means_perc95_plt[l, :],
                 alpha=0.3,
-                color=base_line.get_color(),
+                color=line.get_color(),
             )
         else:
             ax.fill_between(
@@ -334,7 +390,7 @@ def plot_one_prediction(
                 obs_perc5_plt[l, :],
                 obs_perc95_plt[l, :],
                 alpha=0.3,
-                color=base_line.get_color(),
+                color=line.get_color(),
             )
     ax.grid()
 
@@ -343,8 +399,10 @@ def plot_predictions(
     x_meta,
     y_meta,
     x_pred_meta,
-    x_test,
-    y_test,
+    x_test_context,
+    y_test_context,
+    x_test_target,
+    y_test_target,
     x_pred_test,
     pred_summary_prior_meta_untrained,
     pred_summary_prior_meta_trained,
@@ -361,7 +419,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Prior Mean + Meta Data")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -375,7 +433,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Prior Mean\n(trained on meta data)")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -389,7 +447,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Posterior Mean\n(meta data)")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -402,11 +460,13 @@ def plot_predictions(
     ax = axes[0, 3]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Posterior Mean\n(Test)")
-    plot_one_prediction(
-        x=x_test,
-        y=y_test,
+    ax.set_title("Posterior Mean\n(test data)")
+    plot_predictions_for_one_set_of_tasks(
+        x=np.concatenate((x_test_context, x_test_target), axis=1),
+        y=np.concatenate((y_test_context, y_test_target), axis=1),
         x_pred=x_pred_test,
+        x_context=x_test_context,
+        y_context=y_test_context,
         pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=False,
@@ -417,7 +477,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Prior Observation + Meta Data")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -431,7 +491,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Prior Observation\n(trained on meta data)")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -445,7 +505,7 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Posterior Observation\n(meta data)")
-    plot_one_prediction(
+    plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
         x_pred=x_pred_meta,
@@ -459,10 +519,12 @@ def plot_predictions(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("Posterior Observation\n(test data)")
-    plot_one_prediction(
-        x=x_test,
-        y=y_test,
+    plot_predictions_for_one_set_of_tasks(
+        x=np.concatenate((x_test_context, x_test_target), axis=1),
+        y=np.concatenate((y_test_context, y_test_target), axis=1),
         x_pred=x_pred_test,
+        x_context=x_test_context,
+        y_context=y_test_context,
         pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=True,
@@ -603,7 +665,7 @@ def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
     # training loop
     pyro.clear_param_store()
     for i in range(n_iter):
-        elbo = svi.step(x=torch.tensor(x), y=torch.tensor(y))
+        elbo = -svi.step(x=torch.tensor(x), y=torch.tensor(y))
         if i % 100 == 0 or i == len(range(n_iter)) - 1:
             print(f"[iter {i:04d}] elbo = {elbo:.4f}")
 
@@ -640,8 +702,8 @@ def train_model_custom_loss(
     for i in range(n_iter):
         optim.zero_grad()
         regularizer = regularizer_fn(model=model)
-        elbo = elbo_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
-        loss = elbo + alpha_reg * regularizer
+        elbo = -elbo_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
+        loss = -elbo + alpha_reg * regularizer
         loss.backward()
         clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
         optim.step()
@@ -653,17 +715,53 @@ def train_model_custom_loss(
     model.eval()
 
 
+def compute_log_likelihood(model, guide, x, y, n_samples):
+    """
+    Computes predictive log-likelihood using latent samples from guide.
+    """
+    # TODO: average over multiple latent samples
+    # TODO: vectorize
+
+    x, y = torch.tensor(x), torch.tensor(y)
+
+    # run model with latent variables sampled from guide
+    guide_trace = poutine.trace(guide).get_trace(x=x, y=y)
+    replayed_model = poutine.replay(model, trace=guide_trace)
+    model_trace = poutine.trace(replayed_model).get_trace(x=x, y=y)
+
+    # compute log_prob for this pass through model
+    log_prob = model_trace.log_prob_sum()
+
+    return log_prob
+
+
+def compute_log_likelihood2(model, guide, x, y, n_samples):
+    """
+    Computes predictive log-likelihood using latent samples from guide using Predictive.
+    """
+    predictive = Predictive(
+        model=model,
+        guide=guide,
+        num_samples=n_samples,
+    )
+    model_trace = predictive.get_vectorized_trace(x=torch.tensor(x), y=torch.tensor(y))
+
+    log_prob = model_trace.log_prob_sum()
+
+    return log_prob
+
+
 def main():
     # TODO: sample functions
-    # TODO: use exact prior/posterior distributions (e.g., prior is task-independent!)
+    # TODO: use exact prior/posterior distributions, not the KDE (e.g., prior is task-independent!)
     # TODO: implement more complex priors (e.g., not factorized across layers?)
 
     ## flags, constants
     pyro.set_rng_seed(123)
     plot = True
-    smoke_test = True 
+    smoke_test = True
     # benchmark
-    bm = Quadratic1D
+    bm = Affine1D
     n_task_meta = 8
     n_points_per_task_meta = 16
     noise_stddev = 0.01
@@ -673,8 +771,8 @@ def main():
     infer_noise_stddev = True
     prior_type = "diagonal"
     # meta training
-    do_meta_training = True 
-    n_iter_meta = 5000 if not smoke_test else 1000
+    do_meta_training = True
+    n_iter_meta = 5000 if not smoke_test else 100
     initial_lr_meta = 0.1
     final_lr_meta = 0.00001
     alpha_reg_meta = 0.0
@@ -797,21 +895,58 @@ def main():
 
     ## do inference on test task
     print("\n*******************************")
-    print("*** Performing inference... ***")
+    print("*** Performing inference on test task... ***")
     print("*******************************")
     # we need a new guide
     # guide_test = AutoNormal(model=mtblr)
     guide_test = AutoDiagonalNormal(model=mtbreg)
     # guide_test = AutoMultivariateNormal(model=mtblr)
+    n_context = 1
+    x_context, y_context = x_test[:, :n_context, :], y_test[:, :n_context, :]
+    x_target, y_target = x_test[:, n_context:, :], y_test[:, n_context:, :]
     train_model(
         model=mtbreg,
         guide=guide_test,
-        x=x_test,
-        y=y_test,
-        n_iter=n_iter_test,
-        initial_lr=initial_lr_test,
-        final_lr=final_lr_test,
+        x=x_context,
+        y=y_context,
+        n_iter=n_iter_meta,
+        initial_lr=initial_lr_meta,
+        final_lr=final_lr_meta,
     )
+    # pyro.set_rng_seed(123)
+    ll_target = compute_log_likelihood(
+        model=mtbreg,
+        guide=guide_test,
+        x=x_target,
+        y=y_target,
+        n_samples=None,
+    )
+    ll_context = compute_log_likelihood(
+        model=mtbreg,
+        guide=guide_test,
+        x=x_context,
+        y=y_context,
+        n_samples=None,
+    )
+    # pyro.set_rng_seed(123)
+    # ll_target2 = compute_log_likelihood2(
+    #     model=mtbreg,
+    #     guide=guide_test,
+    #     x=x_target,
+    #     y=y_target,
+    #     n_samples=2,
+    # )
+    # ll_context2 = compute_log_likelihood2(
+    #     model=mtbreg,
+    #     guide=guide_test,
+    #     x=x_context,
+    #     y=y_context,
+    #     n_samples=2,
+    # )
+    print(f" ll_target   = {ll_target:.2f}")
+    # print(f" ll_target2  = {ll_target2:.2f}")
+    print(f" ll_context  = {ll_context:.2f}")
+    # print(f" ll_context2 = {ll_context2:.2f}")
     print("*******************************")
 
     # print freezed parameters
@@ -832,8 +967,10 @@ def main():
             x_meta=x_meta,
             y_meta=y_meta,
             x_pred_meta=x_pred_meta,
-            x_test=x_test,
-            y_test=y_test,
+            x_test_context=x_context,
+            y_test_context=y_context,
+            x_test_target=x_target,
+            y_test_target=y_target,
             x_pred_test=x_pred_test,
             pred_summary_prior_meta_untrained=pred_summary_prior_meta_untrained,
             pred_summary_prior_meta_trained=pred_summary_prior_meta_trained,
@@ -852,8 +989,7 @@ def main():
                     bm_meta=bm_meta,
                     bm_test=bm_test,
                     bm_param_idx=0
-                    if isinstance(bm_meta, Linear1D)
-                    or isinstance(bm_meta, Affine1D)
+                    if isinstance(bm_meta, Linear1D) or isinstance(bm_meta, Affine1D)
                     else None,
                     samples_prior_meta_untrained=samples_prior_meta_untrained,
                     samples_prior_meta_trained=samples_prior_meta_trained,
