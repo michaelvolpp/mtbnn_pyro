@@ -124,12 +124,12 @@ class MTBayesianLinear(PyroModule):
         # weight.event_shape == (self.out_features, self.in_features)
         # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
         #  by Predictive)
-        has_sample_shape = len(weight.shape) == 5
-        if not has_sample_shape:
+        has_sample_dim = len(weight.shape) == 5
+        if not has_sample_dim:
             n_samples = 1
             assert weight.shape == (
                 n_tasks,
-                1,  # this is due to the n_pts plate being nested inside of the n_tsk plate
+                1,  # because the n_pts plate is nested inside of the n_tsk plate
                 self.out_features,
                 self.in_features,
             )
@@ -157,7 +157,7 @@ class MTBayesianLinear(PyroModule):
             ## check shapes
             # bias.event_shape = (self.out_features)
             # bias.batch_shape = (n_tasks, 1) or (n_samples, n_tasks, 1) (cf. above)
-            if has_sample_shape:
+            if has_sample_dim:
                 assert bias.shape == (n_samples, n_tasks, 1, self.out_features)
             else:
                 assert bias.shape == (n_tasks, 1, self.out_features)
@@ -169,6 +169,9 @@ class MTBayesianLinear(PyroModule):
 
             ## add the bias
             y = y + bias[:, :, None, :]
+
+        if not has_sample_dim:
+            y.squeeze_(0) # if we do not have a sample dimension, we must not return one
 
         return y
 
