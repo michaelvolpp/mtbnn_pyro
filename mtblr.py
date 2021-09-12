@@ -171,7 +171,9 @@ class MTBayesianLinear(PyroModule):
             y = y + bias[:, :, None, :]
 
         if not has_sample_dim:
-            y.squeeze_(0) # if we do not have a sample dimension, we must not return one
+            y.squeeze_(
+                0
+            )  # if we do not have a sample dimension, we must not return one
 
         return y
 
@@ -720,38 +722,40 @@ def train_model_custom_loss(
 
 def compute_log_likelihood(model, guide, x, y, n_samples):
     """
-    Computes predictive log-likelihood using latent samples from guide.
-    """
-    # TODO: average over multiple latent samples
-    # TODO: vectorize
-
-    x, y = torch.tensor(x), torch.tensor(y)
-
-    # run model with latent variables sampled from guide
-    guide_trace = poutine.trace(guide).get_trace(x=x, y=y)
-    replayed_model = poutine.replay(model, trace=guide_trace)
-    model_trace = poutine.trace(replayed_model).get_trace(x=x, y=y)
-
-    # compute log_prob for this pass through model
-    log_prob = model_trace.log_prob_sum()
-
-    return log_prob
-
-
-def compute_log_likelihood2(model, guide, x, y, n_samples):
-    """
     Computes predictive log-likelihood using latent samples from guide using Predictive.
     """
+    pyro.set_rng_seed(123)
+    x, y = torch.tensor(x), torch.tensor(y)
+
+    log_prob1 = 0.0
+    for _ in range(n_samples):
+        # run model with latent variables sampled from guide
+        guide_trace = poutine.trace(guide).get_trace(x=x, y=y)
+        replayed_model = poutine.replay(model, trace=guide_trace)
+        model_trace1 = poutine.trace(replayed_model).get_trace(x=x, y=y)
+
+        # https://www.programcreek.com/python/?CodeExample=log+likelihood
+        obs_site = model_trace1.nodes["obs"]
+        cur_log_prob1 = obs_site["fn"].log_prob(obs_site["value"])
+        # TODO: this is wrong:
+        log_prob1 += cur_log_prob1.sum()
+
+    pyro.set_rng_seed(123)
     predictive = Predictive(
         model=model,
         guide=guide,
         num_samples=n_samples,
+        parallel=True,
     )
-    model_trace = predictive.get_vectorized_trace(x=torch.tensor(x), y=torch.tensor(y))
+    model_trace2 = predictive.get_vectorized_trace(x=x, y=y)
 
-    log_prob = model_trace.log_prob_sum()
+    # https://www.programcreek.com/python/?CodeExample=log+likelihood
+    obs_site = model_trace2.nodes["obs"]
+    log_prob2 = obs_site["fn"].log_prob(obs_site["value"])
+    # TODO: this is wrong:
+    log_prob2 = log_prob2.sum()
 
-    return log_prob
+    return log_prob1 / n_samples, log_prob2 / n_samples
 
 
 def main():
@@ -916,41 +920,27 @@ def main():
         initial_lr=initial_lr_meta,
         final_lr=final_lr_meta,
     )
-    # pyro.set_rng_seed(123)
-    ll_target = compute_log_likelihood(
+    ll_target, ll_target2 = compute_log_likelihood(
         model=mtbreg,
         guide=guide_test,
         x=x_target,
         y=y_target,
-        n_samples=None,
+        n_samples=10000,
     )
-    ll_context = compute_log_likelihood(
+    ll_context, ll_context2 = compute_log_likelihood(
         model=mtbreg,
         guide=guide_test,
         x=x_context,
         y=y_context,
-        n_samples=None,
+        n_samples=10000,
     )
-    # pyro.set_rng_seed(123)
-    # ll_target2 = compute_log_likelihood2(
-    #     model=mtbreg,
-    #     guide=guide_test,
-    #     x=x_target,
-    #     y=y_target,
-    #     n_samples=2,
-    # )
-    # ll_context2 = compute_log_likelihood2(
-    #     model=mtbreg,
-    #     guide=guide_test,
-    #     x=x_context,
-    #     y=y_context,
-    #     n_samples=2,
-    # )
     print(f" ll_target   = {ll_target:.2f}")
-    # print(f" ll_target2  = {ll_target2:.2f}")
+    print(f" ll_target2  = {ll_target2:.2f}")
     print(f" ll_context  = {ll_context:.2f}")
-    # print(f" ll_context2 = {ll_context2:.2f}")
+    print(f" ll_context2 = {ll_context2:.2f}")
     print("*******************************")
+    # TODO: why do compute_log_likelihood and compute_log_likelihood2 produce different results?
+    # TODO: make compute_log_likelihood2 standard and compute the correct log-likelihood with logsumexp!
 
     # print freezed parameters
     print("\n**************************************")
