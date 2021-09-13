@@ -830,16 +830,12 @@ def main():
     d_hidden = 8
     infer_noise_stddev = True
     prior_type = "diagonal"
-    # meta training
+    # training
     do_meta_training = True
-    n_iter_meta = 1000 if not smoke_test else 100
-    initial_lr_meta = 0.1
-    final_lr_meta = 0.00001
-    alpha_reg_meta = 0.0
-    # adaptation
-    n_iter_test = 250
-    initial_lr_test = 0.01
-    final_lr_test = None
+    n_iter = 1000 if not smoke_test else 100
+    initial_lr = 0.1
+    final_lr = 0.00001
+    alpha_reg = 0.0
     # evaluation
     n_pred = 100
     n_samples = 1000
@@ -908,19 +904,19 @@ def main():
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    # guide = AutoNormal(model=mtblr)
+    # guide_meta = AutoNormal(model=mtblr)
     guide_meta = AutoDiagonalNormal(model=mtbreg)
-    # guide = AutoMultivariateNormal(model=mtblr)
+    # guide_meta = AutoMultivariateNormal(model=mtblr)
     if do_meta_training:
         train_model_custom_loss(
             model=mtbreg,
             guide=guide_meta,
             x=x_meta,
             y=y_meta,
-            n_iter=n_iter_meta,
-            initial_lr=initial_lr_meta,
-            final_lr=final_lr_meta,
-            alpha_reg=alpha_reg_meta,
+            n_iter=n_iter,
+            initial_lr=initial_lr,
+            final_lr=final_lr,
+            alpha_reg=alpha_reg,
         )
     print("*******************************")
 
@@ -952,9 +948,9 @@ def main():
     print("**************************************")
 
     ## do inference on test task
-    print("\n*******************************")
+    print("\n******************************************")
     print("*** Performing inference on test task... ***")
-    print("*******************************")
+    print("********************************************")
     # we need a new guide
     # guide_test = AutoNormal(model=mtblr)
     guide_test = AutoDiagonalNormal(model=mtbreg)
@@ -967,9 +963,9 @@ def main():
         guide=guide_test,
         x=x_context,
         y=y_context,
-        n_iter=n_iter_meta,
-        initial_lr=initial_lr_meta,
-        final_lr=final_lr_meta,
+        n_iter=n_iter,
+        initial_lr=initial_lr,
+        final_lr=final_lr,
     )
     ll_target = compute_log_likelihood(
         model=mtbreg,
@@ -988,8 +984,6 @@ def main():
     print(f" ll_target   = {ll_target:.2f}")
     print(f" ll_context  = {ll_context:.2f}")
     print("*******************************")
-    # TODO: why do compute_log_likelihood and compute_log_likelihood2 produce different results?
-    # TODO: make compute_log_likelihood2 standard and compute the correct log-likelihood with logsumexp!
 
     # print freezed parameters
     print("\n**************************************")
