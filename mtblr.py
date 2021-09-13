@@ -112,9 +112,7 @@ class MTBayesianLinear(PyroModule):
             self.bias = None
 
     def forward(self, x):
-        x = x.detach().clone()
-        weight = self.weight.detach().clone()
-        bias = self.bias.detach().clone()
+        weight, bias = self.weight, self.bias # we will create views below
 
         ## check shapes
         # x.shape = (n_tasks, n_points, d_x)
@@ -124,45 +122,39 @@ class MTBayesianLinear(PyroModule):
         # weight.event_shape == (self.out_features, self.in_features)
         # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
         #  by Predictive)
-        has_sample_dim = len(weight.shape) == 5
+        has_sample_dim = len(self.weight.shape) == 5
         if not has_sample_dim:
-            n_samples = 1
-            assert weight.shape == (
-                n_tasks,
-                1,  # because the n_pts plate is nested inside of the n_tsk plate
-                self.out_features,
-                self.in_features,
-            )
             # add sample dim
+            n_samples = 1
             weight = weight[None, :, :, :, :]
         else:
             n_samples = weight.shape[0]
-        # squeeze n_pts batch dimension
-        weight = weight.squeeze(2)
         assert weight.shape == (
             n_samples,
             n_tasks,
+            1,  # because the n_pts plate is nested inside of the n_tsk plate
             self.out_features,
             self.in_features,
         )
+        # squeeze n_pts batch dimension
+        weight = weight.squeeze(2)
 
         # expand x to sample shape
-        x = x.expand(torch.Size([n_samples]) + x.shape)
+        x_expd = x.expand(torch.Size([n_samples]) + x.shape)
+        # TODO: why do we need x.float() here as soon as we have more than zero layers?
+        x_expd = x_expd.float()
 
         ## compute the linear transformation
-        # TODO: why do we need x.float() here as soon as we have more than zero layers?
-        y = torch.einsum("slyx,slnx->slny", weight, x.float())
+        y = torch.einsum("slyx,slnx->slny", weight, x_expd)
 
         if bias is not None:
             ## check shapes
             # bias.event_shape = (self.out_features)
             # bias.batch_shape = (n_tasks, 1) or (n_samples, n_tasks, 1) (cf. above)
-            if has_sample_dim:
-                assert bias.shape == (n_samples, n_tasks, 1, self.out_features)
-            else:
-                assert bias.shape == (n_tasks, 1, self.out_features)
+            if not has_sample_dim:
                 # add sample dim
                 bias = bias[None, :, :, :]
+            assert bias.shape == (n_samples, n_tasks, 1, self.out_features)
             # squeeze the n_pts batch dimension
             bias = bias.squeeze(2)
             assert bias.shape == (n_samples, n_tasks, self.out_features)
