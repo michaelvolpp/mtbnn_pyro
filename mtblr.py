@@ -167,14 +167,12 @@ class MTBayesianLinear(PyroModule):
             bias = bias.squeeze(2)
             assert bias.shape == (n_samples, n_tasks, self.out_features)
 
-            ## add the bias
+            # add the bias
             y = y + bias[:, :, None, :]
 
         if not has_sample_dim:
-            y.squeeze_(
-                0
-            )  # if we do not have a sample dimension, we must not return one
-
+            # if we do not have a sample dimension, we must not return one
+            y.squeeze_(0)
         return y
 
     def get_prior_distribution(self):
@@ -294,9 +292,10 @@ class MTBayesianRegression(PyroModule):
         noise_stddev = self.noise_stddev  # (sample) noise stddev
         with pyro.plate("tasks", n_tasks, dim=-2):
             mean = self.mtbnn(x)  # sample weights and compute mean pred
-            # noise stddev can have a sample dimension! -> expand to mean's shape
-            noise_stddev = noise_stddev.reshape([-1] + [1] * (mean.ndim - 1))
-            noise_stddev = noise_stddev.expand(mean.shape)
+            if noise_stddev.nelement() > 1:
+                # noise stddev can have a sample dimension! -> expand to mean's shape
+                noise_stddev = noise_stddev.reshape([-1] + [1] * (mean.ndim - 1))
+                noise_stddev = noise_stddev.expand(mean.shape)
             with pyro.plate("data", n_points, dim=-1):
                 obs = pyro.sample(
                     "obs", dist.Normal(mean, noise_stddev).to_event(1), obs=y
@@ -356,17 +355,76 @@ def plot_predictions_for_one_set_of_tasks(
     x_context: Optional[np.ndarray] = None,
     y_context: Optional[np.ndarray] = None,
 ):
+    ## prepare data
+    means_plt = pred_summary["_RETURN"]["mean"]
+    means_perc5_plt = pred_summary["_RETURN"]["5%"]
+    means_perc95_plt = pred_summary["_RETURN"]["95%"]
+    obs_perc5_plt = pred_summary["obs"]["5%"]
+    obs_perc95_plt = pred_summary["obs"]["95%"]
+
+    # assert that all inputs have the same number of dimensions
+    assert (
+        x.ndim
+        == y.ndim
+        == x_pred.ndim
+        == means_plt.ndim
+        == means_perc5_plt.ndim
+        == means_perc95_plt.ndim
+        == obs_perc5_plt.ndim
+        == obs_perc95_plt.ndim
+    )
+    # check that all inputs are one-dimensional
+    assert (
+        x.shape[-1]
+        == y.shape[-1]
+        == x_pred.shape[-1]
+        == means_plt.shape[-1]
+        == means_perc5_plt.shape[-1]
+        == means_perc95_plt.shape[-1]
+        == obs_perc5_plt.shape[-1]
+        == obs_perc95_plt.shape[-1]
+        == 1
+    )
+    # squeeze data dimension
+    if x_context is not None:
+        assert x_context.shape[-1] == y_context.shape[-1] == 1
+    (
+        x,
+        y,
+        x_pred,
+        means_plt,
+        means_perc5_plt,
+        means_perc95_plt,
+        obs_perc5_plt,
+        obs_perc95_plt,
+    ) = (
+        x.squeeze(-1),
+        y.squeeze(-1),
+        x_pred.squeeze(-1),
+        means_plt.squeeze(-1),
+        means_perc5_plt.squeeze(-1),
+        means_perc95_plt.squeeze(-1),
+        obs_perc5_plt.squeeze(-1),
+        obs_perc95_plt.squeeze(-1),
+    )
+    if x_context is not None:
+        x_context, y_context == x_context.squeeze(-1), y_context.squeeze(-1)
+    # check that all inputs have the same number of tasks
+    assert (
+        x.shape[0]
+        == y.shape[0]
+        == means_plt.shape[0]
+        == means_perc5_plt.shape[0]
+        == means_perc95_plt.shape[0]
+        == obs_perc5_plt.shape[0]
+        == obs_perc95_plt.shape[0]
+    )
+
+    ## prepare plot
     if ax is None:
         fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12, 6))
 
-    x_pred = x_pred.squeeze(-1)
-    means_plt = pred_summary["_RETURN"]["mean"].squeeze(-1)
-    means_perc5_plt = pred_summary["_RETURN"]["5%"].squeeze(-1)
-    means_perc95_plt = pred_summary["_RETURN"]["95%"].squeeze(-1)
-    obs_plt = pred_summary["obs"]["mean"].squeeze(-1)
-    obs_perc5_plt = pred_summary["obs"]["5%"].squeeze(-1)
-    obs_perc95_plt = pred_summary["obs"]["95%"].squeeze(-1)
-
+    ## plot
     n_task = x.shape[0]
     for l in range(n_task):
         if l == max_tasks:
@@ -415,7 +473,6 @@ def plot_predictions(
     pred_summary_posterior_test,
     max_tasks=3,
 ):
-    assert x_meta.shape[-1] == y_meta.shape[-1] == x_pred_meta.shape[-1]
 
     fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(12, 6), sharey=True)
     fig.suptitle(f"Prior and Posterior Predictions")
@@ -549,7 +606,6 @@ def plot_distributions(
     samples_posterior_test,
     max_tasks=3,
 ):
-    # TODO: why do we need to squeeze the slope samples?
     fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(12, 6), sharex=True)
     fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
 
@@ -701,13 +757,13 @@ def train_model_custom_loss(
 
     # loss
     regularizer_fn = compute_regularizer
-    elbo_fn = Trace_ELBO().differentiable_loss
+    loss_fn = Trace_ELBO().differentiable_loss
 
     # training loop
     for i in range(n_iter):
         optim.zero_grad()
         regularizer = regularizer_fn(model=model)
-        elbo = -elbo_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
+        elbo = -loss_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
         loss = -elbo + alpha_reg * regularizer
         loss.backward()
         clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
@@ -724,38 +780,35 @@ def compute_log_likelihood(model, guide, x, y, n_samples):
     """
     Computes predictive log-likelihood using latent samples from guide using Predictive.
     """
-    pyro.set_rng_seed(123)
+    # obtain vectorized model trace
     x, y = torch.tensor(x), torch.tensor(y)
-
-    log_prob1 = 0.0
-    for _ in range(n_samples):
-        # run model with latent variables sampled from guide
-        guide_trace = poutine.trace(guide).get_trace(x=x, y=y)
-        replayed_model = poutine.replay(model, trace=guide_trace)
-        model_trace1 = poutine.trace(replayed_model).get_trace(x=x, y=y)
-
-        # https://www.programcreek.com/python/?CodeExample=log+likelihood
-        obs_site = model_trace1.nodes["obs"]
-        cur_log_prob1 = obs_site["fn"].log_prob(obs_site["value"])
-        # TODO: this is wrong:
-        log_prob1 += cur_log_prob1.sum()
-
-    pyro.set_rng_seed(123)
     predictive = Predictive(
         model=model,
         guide=guide,
         num_samples=n_samples,
         parallel=True,
     )
-    model_trace2 = predictive.get_vectorized_trace(x=x, y=y)
+    model_trace = predictive.get_vectorized_trace(x=x, y=y)
 
-    # https://www.programcreek.com/python/?CodeExample=log+likelihood
-    obs_site = model_trace2.nodes["obs"]
-    log_prob2 = obs_site["fn"].log_prob(obs_site["value"])
-    # TODO: this is wrong:
-    log_prob2 = log_prob2.sum()
+    # compute log-likelihood for the observation sites
+    obs_site = model_trace.nodes["obs"]
+    log_prob = obs_site["fn"].log_prob(obs_site["value"])  # reduces event-dims
+    n_task = x.shape[0]
+    n_pts = x.shape[1]
+    assert log_prob.shape == (n_samples, n_task, n_pts)
 
-    return log_prob1 / n_samples, log_prob2 / n_samples
+    # compute predictive likelihood
+    log_prob = torch.sum(log_prob, dim=2, keepdim=True)  # sum pts-per-task dim
+    log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # reduce sampledim
+    log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # sum task dim
+    assert log_prob.shape == (1, 1, 1)
+    log_prob = log_prob.squeeze_()
+    log_prob = log_prob - n_task * torch.log(torch.tensor(n_samples))
+
+    # normalize w.r.t. number of datapoints
+    log_prob = log_prob / n_task / n_pts
+
+    return log_prob
 
 
 def main():
@@ -766,7 +819,7 @@ def main():
     ## flags, constants
     pyro.set_rng_seed(123)
     plot = True
-    smoke_test = True
+    smoke_test = False
     # benchmark
     bm = Affine1D
     n_task_meta = 8
@@ -779,7 +832,7 @@ def main():
     prior_type = "diagonal"
     # meta training
     do_meta_training = True
-    n_iter_meta = 5000 if not smoke_test else 100
+    n_iter_meta = 1000 if not smoke_test else 100
     initial_lr_meta = 0.1
     final_lr_meta = 0.00001
     alpha_reg_meta = 0.0
@@ -828,8 +881,6 @@ def main():
         prior_type=prior_type,
     )
     mtbreg.eval()
-
-    prior_type = mtbreg.get_prior_distribution()
 
     ## obtain predictions before meta training
     with torch.no_grad():
@@ -920,14 +971,14 @@ def main():
         initial_lr=initial_lr_meta,
         final_lr=final_lr_meta,
     )
-    ll_target, ll_target2 = compute_log_likelihood(
+    ll_target = compute_log_likelihood(
         model=mtbreg,
         guide=guide_test,
         x=x_target,
         y=y_target,
         n_samples=10000,
     )
-    ll_context, ll_context2 = compute_log_likelihood(
+    ll_context = compute_log_likelihood(
         model=mtbreg,
         guide=guide_test,
         x=x_context,
@@ -935,9 +986,7 @@ def main():
         n_samples=10000,
     )
     print(f" ll_target   = {ll_target:.2f}")
-    print(f" ll_target2  = {ll_target2:.2f}")
     print(f" ll_context  = {ll_context:.2f}")
-    print(f" ll_context2 = {ll_context2:.2f}")
     print("*******************************")
     # TODO: why do compute_log_likelihood and compute_log_likelihood2 produce different results?
     # TODO: make compute_log_likelihood2 standard and compute the correct log-likelihood with logsumexp!
