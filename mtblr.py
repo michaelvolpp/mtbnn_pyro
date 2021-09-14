@@ -1,6 +1,6 @@
 import copy
 import warnings
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -112,13 +112,9 @@ class MTBayesianLinear(PyroModule):
             self.bias = None
 
     def forward(self, x):
-        weight, bias = self.weight, self.bias # we will create views below
+        weight, bias = self.weight, self.bias  # we will create views below
 
         ## check shapes
-        # x.shape = (n_tasks, n_points, d_x)
-        assert x.ndim == 3
-        n_tasks = x.shape[0]
-
         # weight.event_shape == (self.out_features, self.in_features)
         # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
         #  by Predictive)
@@ -129,6 +125,22 @@ class MTBayesianLinear(PyroModule):
             weight = weight[None, :, :, :, :]
         else:
             n_samples = weight.shape[0]
+
+        # x.shape = (n_tasks, n_points, d_x) for the input layer
+        # x.shape = (n_samples, n_tasks, n_points, d_layer) for hidden layers
+        if x.ndim == 3:  # input layer
+            n_tasks = x.shape[0]
+            n_points = x.shape[1]
+            # expand x to sample shape
+            x_expd = x.expand(torch.Size([n_samples]) + x.shape)
+            x_expd = x_expd.float()
+        else:
+            assert x.ndim == 4
+            n_tasks = x.shape[1]
+            n_points = x.shape[2]
+            x_expd = x
+
+        assert x_expd.shape == (n_samples, n_tasks, n_points, self.in_features)
         assert weight.shape == (
             n_samples,
             n_tasks,
@@ -138,11 +150,6 @@ class MTBayesianLinear(PyroModule):
         )
         # squeeze n_pts batch dimension
         weight = weight.squeeze(2)
-
-        # expand x to sample shape
-        x_expd = x.expand(torch.Size([n_samples]) + x.shape)
-        # TODO: why do we need x.float() here as soon as we have more than zero layers?
-        x_expd = x_expd.float()
 
         ## compute the linear transformation
         y = torch.einsum("slyx,slnx->slny", weight, x_expd)
@@ -344,8 +351,7 @@ def plot_predictions_for_one_set_of_tasks(
     plot_obs: bool,
     ax: None,
     max_tasks: int,
-    x_context: Optional[np.ndarray] = None,
-    y_context: Optional[np.ndarray] = None,
+    n_contexts: Optional[np.ndarray] = None,
 ):
     ## prepare data
     means_plt = pred_summary["_RETURN"]["mean"]
@@ -377,9 +383,17 @@ def plot_predictions_for_one_set_of_tasks(
         == obs_perc95_plt.shape[-1]
         == 1
     )
+    # check that all inputs have the same number of tasks
+    assert (
+        x.shape[0]
+        == y.shape[0]
+        == means_plt.shape[0]
+        == means_perc5_plt.shape[0]
+        == means_perc95_plt.shape[0]
+        == obs_perc5_plt.shape[0]
+        == obs_perc95_plt.shape[0]
+    )
     # squeeze data dimension
-    if x_context is not None:
-        assert x_context.shape[-1] == y_context.shape[-1] == 1
     (
         x,
         y,
@@ -399,18 +413,6 @@ def plot_predictions_for_one_set_of_tasks(
         obs_perc5_plt.squeeze(-1),
         obs_perc95_plt.squeeze(-1),
     )
-    if x_context is not None:
-        x_context, y_context == x_context.squeeze(-1), y_context.squeeze(-1)
-    # check that all inputs have the same number of tasks
-    assert (
-        x.shape[0]
-        == y.shape[0]
-        == means_plt.shape[0]
-        == means_perc5_plt.shape[0]
-        == means_perc95_plt.shape[0]
-        == obs_perc5_plt.shape[0]
-        == obs_perc95_plt.shape[0]
-    )
 
     ## prepare plot
     if ax is None:
@@ -423,10 +425,15 @@ def plot_predictions_for_one_set_of_tasks(
             break
         line = ax.plot(x_pred[l, :], means_plt[l, :])[0]
         ax.scatter(x[l, :], y[l, :], color=line.get_color())
-        if x_context is not None:
+        if n_contexts is not None:
+            x_context, y_context, _, _ = split_task(
+                x=x[l : l + 1, :][:, :, None],
+                y=y[l : l + 1, :][:, :, None],
+                n_context=n_contexts[l],
+            )
             ax.scatter(
-                x_context[l, :],
-                y_context[l, :],
+                x_context,
+                y_context,
                 marker="x",
                 s=100,
                 color=line.get_color(),
@@ -454,10 +461,9 @@ def plot_predictions(
     x_meta,
     y_meta,
     x_pred_meta,
-    x_test_context,
-    y_test_context,
-    x_test_target,
-    y_test_target,
+    x_test,
+    y_test,
+    n_contexts_test,
     x_pred_test,
     pred_summary_prior_meta_untrained,
     pred_summary_prior_meta_trained,
@@ -516,11 +522,10 @@ def plot_predictions(
     ax.set_ylabel("y")
     ax.set_title("Posterior Mean\n(test data)")
     plot_predictions_for_one_set_of_tasks(
-        x=np.concatenate((x_test_context, x_test_target), axis=1),
-        y=np.concatenate((y_test_context, y_test_target), axis=1),
+        x=x_test,
+        y=y_test,
         x_pred=x_pred_test,
-        x_context=x_test_context,
-        y_context=y_test_context,
+        n_contexts=n_contexts_test,
         pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=False,
@@ -574,11 +579,10 @@ def plot_predictions(
     ax.set_ylabel("y")
     ax.set_title("Posterior Observation\n(test data)")
     plot_predictions_for_one_set_of_tasks(
-        x=np.concatenate((x_test_context, x_test_target), axis=1),
-        y=np.concatenate((y_test_context, y_test_target), axis=1),
+        x=x_test,
+        y=y_test,
         x_pred=x_pred_test,
-        x_context=x_test_context,
-        y_context=y_test_context,
+        n_contexts=n_contexts_test,
         pred_summary=pred_summary_posterior_test,
         ax=ax,
         plot_obs=True,
@@ -589,9 +593,8 @@ def plot_predictions(
 
 def plot_distributions(
     site_name,
-    bm_meta,
-    bm_test,
-    bm_param_idx,
+    bm_meta_params,
+    bm_test_params,
     samples_prior_meta_untrained,
     samples_prior_meta_trained,
     samples_posterior_meta,
@@ -601,7 +604,10 @@ def plot_distributions(
     fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(12, 6), sharex=True)
     fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
 
-    for l, task in enumerate(bm_meta):
+    n_meta_tasks = samples_prior_meta_untrained[site_name].shape[1]
+    n_test_tasks = samples_posterior_test[site_name].shape[1]
+
+    for l in range(n_meta_tasks):
         if l == max_tasks:
             break
         ax = axes[0]
@@ -611,8 +617,8 @@ def plot_distributions(
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
-        if bm_param_idx is not None:
-            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+        if bm_meta_params is not None:
+            ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
         ax = axes[1]
         ax.set_title("Prior distribution\n(trained on meta data)")
@@ -621,8 +627,8 @@ def plot_distributions(
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
-        if bm_param_idx is not None:
-            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+        if bm_meta_params is not None:
+            ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
         ax = axes[2]
         ax.set_title("Posterior distribution\n(meta data)")
@@ -631,21 +637,19 @@ def plot_distributions(
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
-        if bm_param_idx is not None:
-            ax.axvline(x=task.param[bm_param_idx], color=sns.color_palette()[l])
+        if bm_meta_params is not None:
+            ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
-    ax = axes[3]
-    ax.set_title("Posterior distribution\n(test data)")
-    sns.distplot(
-        samples_posterior_test[site_name].squeeze(),
-        kde_kws={"label": f"Test Task"},
-        ax=ax,
-    )
-    if bm_param_idx is not None:
-        ax.axvline(
-            x=bm_test.get_task_by_index(0).param[bm_param_idx],
-            color=sns.color_palette()[0],
+    for l in range(n_test_tasks):
+        ax = axes[3]
+        ax.set_title("Posterior distribution\n(test data)")
+        sns.distplot(
+            samples_posterior_test[site_name].squeeze()[:, l],
+            kde_kws={"label": f"Test Task {l}"},
+            ax=ax,
         )
+        if bm_test_params is not None:
+            ax.axvline(x=bm_test_params[l], color=sns.color_palette()[l])
 
     axes[0].legend()
     axes[1].legend()
@@ -752,12 +756,14 @@ def train_model_custom_loss(
     loss_fn = Trace_ELBO().differentiable_loss
 
     # training loop
+    train_losses = []
     for i in range(n_iter):
         optim.zero_grad()
         regularizer = regularizer_fn(model=model)
         elbo = -loss_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
         loss = -elbo + alpha_reg * regularizer
         loss.backward()
+        train_losses.append(loss.item())
         clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
         optim.step()
         if lr_scheduler is not None:
@@ -766,6 +772,8 @@ def train_model_custom_loss(
             print(f"[iter {i:04d}] elbo = {elbo:.4e} | reg = {regularizer:.4e}")
 
     model.eval()
+
+    return train_losses
 
 
 def compute_log_likelihood(model, guide, x, y, n_samples):
@@ -803,6 +811,74 @@ def compute_log_likelihood(model, guide, x, y, n_samples):
     return log_prob
 
 
+def stack_pred_summaries_along_task_dim(pred_summaries: List):
+    task_dim = 0  # in the pred_summary, the sample dim is already reduced
+
+    result = {}
+    for pred_summary in pred_summaries:
+        if not result:
+            result = pred_summary
+            continue
+
+        for k0, v0 in pred_summary.items():
+            for k1, v1 in v0.items():
+                result[k0][k1] = np.concatenate((result[k0][k1], v1), axis=task_dim)
+
+    return result
+
+
+def stack_samples_along_task_dim(samples: List):
+    task_dim = 1  # the zeroth dim is the sample dim
+
+    result = {}
+    for sample in samples:
+        if not result:
+            result = sample
+            continue
+
+        for k, v in sample.items():
+            result[k] = np.concatenate((result[k], v), axis=task_dim)
+
+    return result
+
+
+def split_task(x, y, n_context):
+    x_context, y_context = x[:, :n_context, :], y[:, :n_context, :]
+    # TODO: use all data as target?
+    x_target, y_target = x, y
+
+    return x_context, y_context, x_target, y_target
+
+
+def plot_metrics(train_losses_meta, lls, lls_context, n_contexts):
+    fig, axes = plt.subplots(nrows=1, ncols=2, squeeze=False)
+    fig.suptitle("Metrics")
+
+    ax = axes[0, 0]
+    ax.set_title("Learning Curve")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_yscale("symlog")  # TODO: think about symlog scaling
+    if train_losses_meta is not None:
+        ax.plot(
+            np.arange(len(train_losses_meta)), train_losses_meta, label="meta training"
+        )
+        ax.legend()
+    ax.grid()
+
+    ax = axes[0, 1]
+    ax.set_title("Marginal Log-Likelihood")
+    ax.set_xlabel("n_context")
+    ax.set_xticks(n_contexts)
+    ax.set_ylabel("marginal ll")
+    ax.plot(n_contexts, lls, label="all data")
+    ax.plot(n_contexts, lls_context, label="context only")
+    ax.legend()
+    ax.grid()
+
+    fig.tight_layout()
+
+
 def main():
     # TODO: sample functions
     # TODO: use exact prior/posterior distributions, not the KDE (e.g., prior is task-independent!)
@@ -813,24 +889,29 @@ def main():
     plot = True
     smoke_test = False
     # benchmark
-    bm = Affine1D
+    bm = Quadratic1D
     n_task_meta = 8
     n_points_per_task_meta = 16
     noise_stddev = 0.01
     # model
-    n_hidden = 0
+    n_hidden = 1
     d_hidden = 8
     infer_noise_stddev = True
     prior_type = "diagonal"
     # training
-    do_meta_training = True
-    n_iter = 1000 if not smoke_test else 100
+    do_meta_training = False
+    n_iter = 5000 if not smoke_test else 100
     initial_lr = 0.1
     final_lr = 0.00001
     alpha_reg = 0.0
     # evaluation
+    n_contexts = (
+        np.array([0, 1, 2, 5, 10, n_points_per_task_meta])
+        if not smoke_test
+        else np.array([0, 5, 10])
+    )
     n_pred = 100
-    n_samples = 1000
+    n_samples = 1000 if not smoke_test else 100
     max_plot_tasks = 5
 
     ## create benchmarks
@@ -900,7 +981,7 @@ def main():
     guide_meta = AutoDiagonalNormal(model=mtbreg)
     # guide_meta = AutoMultivariateNormal(model=mtblr)
     if do_meta_training:
-        train_model_custom_loss(
+        train_losses_meta = train_model_custom_loss(
             model=mtbreg,
             guide=guide_meta,
             x=x_meta,
@@ -910,6 +991,8 @@ def main():
             final_lr=final_lr,
             alpha_reg=alpha_reg,
         )
+    else:
+        train_losses_meta = None
     print("*******************************")
 
     ## print learned parameters
@@ -940,44 +1023,55 @@ def main():
     print("**************************************")
 
     ## do inference on test task
-    print("\n******************************************")
-    print("*** Performing inference on test task... ***")
-    print("********************************************")
-    # we need a new guide
-    # guide_test = AutoNormal(model=mtblr)
-    guide_test = AutoDiagonalNormal(model=mtbreg)
-    # guide_test = AutoMultivariateNormal(model=mtblr)
-    n_context = 1
-    x_context, y_context = x_test[:, :n_context, :], y_test[:, :n_context, :]
-    x_target, y_target = x_test[:, n_context:, :], y_test[:, n_context:, :]
-    train_model(
-        model=mtbreg,
-        guide=guide_test,
-        x=x_context,
-        y=y_context,
-        n_iter=n_iter,
-        initial_lr=initial_lr,
-        final_lr=final_lr,
-    )
-    ll_target = compute_log_likelihood(
-        model=mtbreg,
-        guide=guide_test,
-        x=x_target,
-        y=y_target,
-        n_samples=10000,
-    )
-    ll_context = compute_log_likelihood(
-        model=mtbreg,
-        guide=guide_test,
-        x=x_context,
-        y=y_context,
-        n_samples=10000,
-    )
-    print(f" ll_target   = {ll_target:.2f}")
-    print(f" ll_context  = {ll_context:.2f}")
-    print("*******************************")
+    lls = np.zeros(n_contexts.shape)
+    lls_context = np.zeros(n_contexts.shape)
+    guides = []
+    for i, n_context in enumerate(n_contexts):
+        print("\n**************************************************************")
+        print(
+            f"*** Performing inference on test task (n_context = {n_context:3d})... ***"
+        )
+        print("**************************************************************")
+        x_context, y_context, x_target, y_target = split_task(
+            x=x_test, y=y_test, n_context=n_context
+        )
+        if n_context != 0:
+            # we need a new guide
+            # guide_test = AutoNormal(model=mtblr)
+            cur_guide = AutoDiagonalNormal(model=mtbreg)
+            # guide_test = AutoMultivariateNormal(model=mtblr)
+            train_model(
+                model=mtbreg,
+                guide=cur_guide,
+                x=x_context,
+                y=y_context,
+                n_iter=n_iter,
+                initial_lr=initial_lr,
+                final_lr=final_lr,
+            )
+        else:
+            cur_guide = None
+        guides.append(cur_guide)
+        lls[i] = compute_log_likelihood(
+            model=mtbreg,
+            guide=cur_guide,
+            x=x_target,
+            y=y_target,
+            n_samples=10000,
+        )
+        if n_context != 0:
+            lls_context[i] = compute_log_likelihood(
+                model=mtbreg,
+                guide=cur_guide,
+                x=x_context,
+                y=y_context,
+                n_samples=10000,
+            )
+        else:
+            lls_context[i] = np.nan
+        print("*******************************")
 
-    # print freezed parameters
+    # print freezed parameters (make sure adaptation step did not change them)
     print("\n**************************************")
     print("*** Posterior parameters (freezed) ***")
     print("**************************************")
@@ -985,21 +1079,36 @@ def main():
     print("**************************************")
 
     # obtain posterior predictions
-    pred_summary_posterior_test, samples_posterior_test = predict(
-        model=mtbreg, guide=guide_test, x=x_pred_test, n_samples=n_samples
+    pred_summary_posterior_test, samples_posterior_test = [], []
+    for guide in guides:
+        cur_pred_summary_posterior_test, cur_samples_posterior_test = predict(
+            model=mtbreg, guide=guide, x=x_pred_test, n_samples=n_samples
+        )
+        pred_summary_posterior_test.append(cur_pred_summary_posterior_test)
+        samples_posterior_test.append(cur_samples_posterior_test)
+    pred_summary_posterior_test = stack_pred_summaries_along_task_dim(
+        pred_summary_posterior_test
     )
+    samples_posterior_test = stack_samples_along_task_dim(samples_posterior_test)
 
     # plot predictions
     if plot:
+        plot_metrics(
+            train_losses_meta=train_losses_meta,
+            lls=lls,
+            lls_context=lls_context,
+            n_contexts=n_contexts,
+        )
         plot_predictions(
             x_meta=x_meta,
             y_meta=y_meta,
             x_pred_meta=x_pred_meta,
-            x_test_context=x_context,
-            y_test_context=y_context,
-            x_test_target=x_target,
-            y_test_target=y_target,
-            x_pred_test=x_pred_test,
+            x_test=np.broadcast_to(x_test, (len(n_contexts),) + x_test.shape[1:]),
+            y_test=np.broadcast_to(y_test, (len(n_contexts),) + y_test.shape[1:]),
+            x_pred_test=np.broadcast_to(
+                x_pred_test, (len(n_contexts),) + x_pred_test.shape[1:]
+            ),
+            n_contexts_test=n_contexts,
             pred_summary_prior_meta_untrained=pred_summary_prior_meta_untrained,
             pred_summary_prior_meta_trained=pred_summary_prior_meta_trained,
             pred_summary_posterior_meta=pred_summary_posterior_meta,
@@ -1012,24 +1121,44 @@ def main():
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
+                if isinstance(bm_meta, Affine1D):
+                    bm_meta_params = np.zeros(n_task_meta)
+                    for l, task in enumerate(bm_meta):
+                        bm_meta_params[l] = task.param[0]
+                else:
+                    bm_meta_params = None
+                if isinstance(bm_test, Affine1D):
+                    bm_test_params = bm_test.get_task_by_index(0).param[0] * np.ones(
+                        len(n_contexts)
+                    )
+                else:
+                    bm_test_params = None
                 plot_distributions(
                     site_name="mtbnn.net.0.weight",
-                    bm_meta=bm_meta,
-                    bm_test=bm_test,
-                    bm_param_idx=0
-                    if isinstance(bm_meta, Linear1D) or isinstance(bm_meta, Affine1D)
-                    else None,
+                    bm_meta_params=bm_meta_params,
+                    bm_test_params=bm_test_params,
                     samples_prior_meta_untrained=samples_prior_meta_untrained,
                     samples_prior_meta_trained=samples_prior_meta_trained,
                     samples_posterior_meta=samples_posterior_meta,
                     samples_posterior_test=samples_posterior_test,
                 )
 
+                if isinstance(bm_meta, Affine1D):
+                    bm_meta_params = np.zeros(n_task_meta)
+                    for l, task in enumerate(bm_meta):
+                        bm_meta_params[l] = task.param[1]
+                else:
+                    bm_meta_params = None
+                if isinstance(bm_test, Affine1D):
+                    bm_test_params = bm_test.get_task_by_index(0).param[1] * np.ones(
+                        len(n_contexts)
+                    )
+                else:
+                    bm_test_params = None
                 plot_distributions(
                     site_name="mtbnn.net.0.bias",
-                    bm_meta=bm_meta,
-                    bm_test=bm_test,
-                    bm_param_idx=1 if isinstance(bm_meta, Affine1D) else None,
+                    bm_meta_params=bm_meta_params,
+                    bm_test_params=bm_test_params,
                     samples_prior_meta_untrained=samples_prior_meta_untrained,
                     samples_prior_meta_trained=samples_prior_meta_trained,
                     samples_posterior_meta=samples_posterior_meta,
