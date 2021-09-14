@@ -1,6 +1,6 @@
 import copy
 import warnings
-from typing import Optional, List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -705,30 +705,6 @@ def compute_regularizer(model):
     return regularizer
 
 
-def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
-    model.train()
-
-    # optimizer
-    optim_args = {}
-    optim_args["lr"] = initial_lr
-    if final_lr is not None:
-        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
-        optim_args["lrd"] = gamma ** (1 / n_iter)
-    optim = ClippedAdam(optim_args=optim_args)
-
-    # SVI
-    svi = SVI(model=model, guide=guide, optim=optim, loss=Trace_ELBO())
-
-    # training loop
-    pyro.clear_param_store()
-    for i in range(n_iter):
-        elbo = -svi.step(x=torch.tensor(x), y=torch.tensor(y))
-        if i % 100 == 0 or i == len(range(n_iter)) - 1:
-            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
-
-    model.eval()
-
-
 def train_model_custom_loss(
     model, guide, x, y, n_iter, initial_lr, alpha_reg, final_lr=None
 ):
@@ -841,14 +817,28 @@ def stack_samples_along_task_dim(samples: List):
 
     return result
 
+def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
+    model.train()
 
-def split_task(x, y, n_context):
-    x_context, y_context = x[:, :n_context, :], y[:, :n_context, :]
-    # TODO: use all data as target?
-    x_target, y_target = x, y
+    # optimizer
+    optim_args = {}
+    optim_args["lr"] = initial_lr
+    if final_lr is not None:
+        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+        optim_args["lrd"] = gamma ** (1 / n_iter)
+    optim = ClippedAdam(optim_args=optim_args)
 
-    return x_context, y_context, x_target, y_target
+    # SVI
+    svi = SVI(model=model, guide=guide, optim=optim, loss=Trace_ELBO())
 
+    # training loop
+    pyro.clear_param_store()
+    for i in range(n_iter):
+        elbo = -svi.step(x=torch.tensor(x), y=torch.tensor(y))
+        if i % 100 == 0 or i == len(range(n_iter)) - 1:
+            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
+
+    model.eval()
 
 def plot_metrics(train_losses_meta, lls, lls_context, n_contexts):
     fig, axes = plt.subplots(nrows=1, ncols=2, squeeze=False)
@@ -877,6 +867,14 @@ def plot_metrics(train_losses_meta, lls, lls_context, n_contexts):
     ax.grid()
 
     fig.tight_layout()
+
+
+def split_task(x, y, n_context):
+    x_context, y_context = x[:, :n_context, :], y[:, :n_context, :]
+    # TODO: use all data as target?
+    x_target, y_target = x, y
+
+    return x_context, y_context, x_target, y_target
 
 
 def main():
@@ -1057,7 +1055,7 @@ def main():
             guide=cur_guide,
             x=x_target,
             y=y_target,
-            n_samples=10000,
+            n_samples=n_samples,
         )
         if n_context != 0:
             lls_context[i] = compute_log_likelihood(
@@ -1065,7 +1063,7 @@ def main():
                 guide=cur_guide,
                 x=x_context,
                 y=y_context,
-                n_samples=10000,
+                n_samples=n_samples,
             )
         else:
             lls_context[i] = np.nan
