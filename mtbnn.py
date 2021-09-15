@@ -32,7 +32,196 @@ from torch.optim.lr_scheduler import ExponentialLR
 # https://pyro.ai/examples/tensor_shapes.html#Declaring-independent-dims-with-plate
 
 
-class MTBayesianLinear(PyroModule):
+def _generate_mtbnn_module(
+    d_x: int, d_y: int, n_hidden: int, d_hidden: int, prior_type: str
+) -> PyroModule:
+
+    """
+    Generate a multi-task Bayesian neural network Pyro module.
+    """
+    modules = []
+    if n_hidden == 0:
+        modules.append(
+            MultiTaskBayesianLinear(
+                in_features=d_x,
+                out_features=d_y,
+                bias=True,
+                prior_type=prior_type,
+            )
+        )
+    else:
+        modules.append(
+            MultiTaskBayesianLinear(
+                in_features=d_x,
+                out_features=d_hidden,
+                bias=True,
+                prior_type=prior_type,
+            )
+        )
+        modules.append(PyroModule[nn.Tanh]())
+        for _ in range(n_hidden - 1):
+            modules.append(
+                MultiTaskBayesianLinear(
+                    in_features=d_hidden,
+                    out_features=d_hidden,
+                    bias=True,
+                    prior_type=prior_type,
+                )
+            )
+            modules.append(PyroModule[nn.Tanh]())
+        modules.append(
+            MultiTaskBayesianLinear(
+                in_features=d_hidden,
+                out_features=d_y,
+                bias=True,
+                prior_type=prior_type,
+            )
+        )
+    net = PyroModule[nn.Sequential](*modules)
+
+    return net
+
+
+def _kl_regularizer(model: PyroModule):
+    prior = model.get_prior_distribution()
+    regularizer = torch.tensor(0.0)
+    for prior_factor in prior:
+        assert len(prior_factor.batch_shape) == 0
+        normal = (
+            dist.Normal(0.0, 1.0)
+            .expand(prior_factor.event_shape)
+            .to_event(len(prior_factor.event_shape))
+        )
+        kl = kl_divergence(prior_factor, normal)
+        regularizer = regularizer + kl
+    return regularizer
+
+
+def _train_model_svi(
+    model: PyroModule,
+    guide: PyroModule,
+    x: torch.tensor,
+    y: torch.tensor,
+    n_epochs: int,
+    alpha_reg: float,
+    initial_lr: float,
+    final_lr: Optional[float] = None,
+) -> torch.tensor:
+    ## get parameters
+    pyro.clear_param_store()  # to forget old guide shapes
+    params_model = list(model.parameters())
+    guide(x=x, y=y)
+    params_guide = list(guide.parameters())
+    params = params_model + params_guide
+
+    ## optimizer
+    # use the same tweaks as Pyro's ClippedAdam: LR decay and gradient clipping
+    # (gradient clipping is implemented in the training loop itself)
+    optim = AdamTorch(params=params, lr=initial_lr)
+    if final_lr is not None:
+        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+        lr_decay = gamma ** (1 / n_epochs)
+        lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
+    else:
+        lr_scheduler = None
+
+    ## loss
+    regularizer_fn = _kl_regularizer
+    loss_fn = Trace_ELBO().differentiable_loss
+
+    ## training loop
+    train_losses = []
+    for i in range(n_epochs):
+        optim.zero_grad()
+
+        # compute loss
+        elbo = -loss_fn(
+            model=model,
+            guide=guide,
+            x=x,
+            y=y,
+        )
+        loss = -elbo
+
+        # add regularizer
+        if regularizer_fn is not None:
+            regularizer = regularizer_fn(model=model)
+            loss = loss + alpha_reg * regularizer
+
+        # compute gradients and step
+        loss.backward()
+        clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
+        optim.step()
+
+        # adapt lr
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        # logging
+        train_losses.append(loss.item())
+        if i % 100 == 0 or i == len(range(n_epochs)) - 1:
+            print(f"[iter {i:04d}] elbo = {elbo:.4e} | reg = {regularizer:.4e}")
+
+    return torch.tensor(train_losses)
+
+
+def _marginal_log_likelihood(
+    model: PyroModule,
+    guide: PyroModule,
+    x: torch.tensor,
+    y: torch.tensor,
+    n_samples: int,
+) -> torch.tensor:
+    """
+    Computes predictive log-likelihood using latent samples from guide using Predictive.
+    """
+    # obtain vectorized model trace
+    predictive = Predictive(
+        model=model,
+        guide=guide,
+        num_samples=n_samples,
+        parallel=True,
+    )
+    model_trace = predictive.get_vectorized_trace(x=x, y=y)
+
+    # compute log-likelihood for the observation sites
+    obs_site = model_trace.nodes["obs"]
+    log_prob = obs_site["fn"].log_prob(obs_site["value"])  # reduces event-dims
+    n_task = x.shape[0]
+    n_pts = x.shape[1]
+    assert log_prob.shape == (n_samples, n_task, n_pts)
+
+    # compute predictive likelihood
+    log_prob = torch.sum(log_prob, dim=2, keepdim=True)  # sum pts-per-task dim
+    log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # reduce sampledim
+    log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # sum task dim
+    assert log_prob.shape == (1, 1, 1)
+    log_prob = log_prob.squeeze_()
+    log_prob = log_prob - n_task * torch.log(torch.tensor(n_samples))
+
+    # normalize w.r.t. number of datapoints
+    log_prob = log_prob / n_task / n_pts
+
+    return log_prob
+
+
+def summarize_samples(samples: dict) -> dict:
+    site_stats = {}
+    for k, v in samples.items():
+        site_stats[k] = {
+            "mean": np.mean(v, axis=0),
+            "std": np.std(v, axis=0),
+            "5%": np.percentile(v, 5, axis=0),
+            "95%": np.percentile(v, 95, axis=0),
+        }
+    return site_stats
+
+
+class MultiTaskBayesianLinear(PyroModule):
+    """
+    A multi-task Bayesian linear layer.
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -111,7 +300,7 @@ class MTBayesianLinear(PyroModule):
         else:
             self.bias = None
 
-    def forward(self, x):
+    def forward(self, x: torch.tensor) -> torch.tensor:
         weight, bias = self.weight, self.bias  # we will create views below
 
         ## check shapes
@@ -166,104 +355,39 @@ class MTBayesianLinear(PyroModule):
             bias = bias.squeeze(2)
             assert bias.shape == (n_samples, n_tasks, self.out_features)
 
-            # add the bias
+            ## add the bias
             y = y + bias[:, :, None, :]
 
         if not has_sample_dim:
             # if we do not have a sample dimension, we must not return one
             y.squeeze_(0)
+
         return y
 
-    def get_prior_distribution(self):
+    def get_prior_distribution(self) -> List:
         return [self.weight_prior(self), self.bias_prior(self)]
 
 
-class MTBNN(PyroModule):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        n_hidden: int,
-        d_hidden: int,
-        prior_type: str,
-    ):
-        super().__init__()
+class MultiTaskBayesianNeuralNetwork(PyroModule):
+    """
+    A multi-task Bayesian neural network.
+    """
 
-        self.n_hidden = n_hidden
-        modules = []
-        if self.n_hidden == 0:
-            modules.append(
-                MTBayesianLinear(
-                    in_features=in_features,
-                    out_features=out_features,
-                    bias=True,
-                    prior_type=prior_type,
-                )
-            )
-        else:
-            modules.append(
-                MTBayesianLinear(
-                    in_features=in_features,
-                    out_features=d_hidden,
-                    bias=True,
-                    prior_type=prior_type,
-                )
-            )
-            modules.append(PyroModule[nn.Tanh]())
-            for _ in range(self.n_hidden - 1):
-                modules.append(
-                    MTBayesianLinear(
-                        in_features=d_hidden,
-                        out_features=d_hidden,
-                        bias=True,
-                        prior_type=prior_type,
-                    )
-                )
-                modules.append(PyroModule[nn.Tanh]())
-            modules.append(
-                MTBayesianLinear(
-                    in_features=d_hidden,
-                    out_features=out_features,
-                    bias=True,
-                    prior_type=prior_type,
-                )
-            )
-        self.net = PyroModule[nn.Sequential](*modules)
-
-    def forward(self, x):
-        return self.net(x)
-
-    def freeze_prior(self):
-        # freeze the unconstrained parameters
-        # -> those are the leaf variables of the autograd graph
-        # -> those are the registered parameters of self
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def get_prior_distribution(self):
-        prior_distribution = []
-        for module in self.net:
-            if hasattr(module, "get_prior_distribution"):
-                prior_distribution += module.get_prior_distribution()
-        return prior_distribution
-
-
-class MTBayesianRegression(PyroModule):
     def __init__(
         self,
         d_x: int,
         d_y: int,
         n_hidden: int,
         d_hidden: int,
+        prior_type: str,
         noise_stddev: Optional[float] = None,
-        prior_type: str = "isotropic",
     ):
         super().__init__()
 
-        ## multi-task BNN
-        self.mtbnn = MTBNN(
-            in_features=d_x,
-            out_features=d_y,
+        ## the mean network
+        self.net = _generate_mtbnn_module(
+            d_x=d_x,
+            d_y=d_y,
             n_hidden=n_hidden,
             d_hidden=d_hidden,
             prior_type=prior_type,
@@ -280,7 +404,56 @@ class MTBayesianRegression(PyroModule):
             else noise_stddev
         )
 
-    def forward(self, x: torch.tensor, y: Optional[torch.tensor] = None):
+        ## the current guide
+        self._meta_guide = None
+        self._guide = None
+
+        ## set evaluation mode
+        self.freeze_prior()
+        self.eval()
+
+    def freeze_prior(self) -> None:
+        """
+        Freeze the unconstrained parameters.
+        -> those are the leaf variables of the autograd graph
+        -> those are the registered parameters of self
+        """
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def unfreeze_prior(self) -> None:
+        """
+        Unfreeze the unconstrained parameters.
+        -> those are the leaf variables of the autograd graph
+        -> those are the registered parameters of self
+        """
+        for p in self.parameters():
+            p.requires_grad = True
+
+    def get_prior_distribution(self) -> List:
+        prior_distribution = []
+        for module in self.net:
+            if hasattr(module, "get_prior_distribution"):
+                prior_distribution += module.get_prior_distribution()
+        return prior_distribution
+
+    @staticmethod
+    def print_parameters() -> None:
+        first = True
+        for name in pyro.get_param_store().keys():
+            if first:
+                first = False
+            else:
+                print("\n")
+            print(
+                f"name  = {name}"
+                f"\nshape = {pyro.param(name).shape}"
+                f"\nvalue = {pyro.param(name)}"
+            )
+
+    def forward(
+        self, x: torch.tensor, y: Optional[torch.tensor] = None
+    ) -> torch.tensor:
         # shapes
         assert x.ndim == 3
         if y is not None:
@@ -290,7 +463,7 @@ class MTBayesianRegression(PyroModule):
 
         noise_stddev = self.noise_stddev  # (sample) noise stddev
         with pyro.plate("tasks", n_tasks, dim=-2):
-            mean = self.mtbnn(x)  # sample weights and compute mean pred
+            mean = self.net(x)  # sample weights and compute mean pred
             if noise_stddev.nelement() > 1:
                 # noise stddev can have a sample dimension! -> expand to mean's shape
                 noise_stddev = noise_stddev.reshape([-1] + [1] * (mean.ndim - 1))
@@ -301,46 +474,128 @@ class MTBayesianRegression(PyroModule):
                 )  # score mean predictions against ground truth
         return mean
 
-    def freeze_prior(self):
-        self.mtbnn.freeze_prior()
+    def get_guide(self, guide: str) -> Optional[PyroModule]:
+        assert guide == "meta" or guide == "test" or guide == "prior"
+        if guide == "meta":
+            guide = self._meta_guide
+        elif guide == "test":
+            guide = self._guide
+        else:
+            guide = None
 
-    def get_prior_distribution(self):
-        return self.mtbnn.get_prior_distribution()
+        return guide
 
+    def meta_train(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        n_epochs: int,
+        initial_lr: float,
+        final_lr: float,
+        alpha_reg: float,
+    ) -> np.ndarray:
+        self.unfreeze_prior()
+        self.train()
 
-def predict(model, guide, x: np.ndarray, n_samples: int):
-    predictive = Predictive(
-        model=model,
-        guide=guide,
-        num_samples=n_samples,
-        parallel=True,  # our model is vectorized
-        return_sites=(
-            # if model is linear, those sites are available
-            "mtbnn.net.0.weight",
-            "mtbnn.net.0.bias",
-            # those sites are always available
-            "obs",
-            "sigma",
-            "_RETURN",
-        ),
-    )
-    svi_samples = predictive(x=torch.tensor(x), y=None)
-    svi_samples = {k: v for k, v in svi_samples.items()}
-    pred_summary = summary(svi_samples)
+        meta_guide = AutoDiagonalNormal(model=self)
+        epoch_losses = _train_model_svi(
+            model=self,
+            guide=meta_guide,
+            x=torch.tensor(x, dtype=torch.float),
+            y=torch.tensor(y, dtype=torch.float),
+            n_epochs=n_epochs,
+            initial_lr=initial_lr,
+            final_lr=final_lr,
+            alpha_reg=alpha_reg,
+        )
 
-    return pred_summary, svi_samples
+        self._meta_guide = meta_guide
+        self.eval()
+        self.freeze_prior()
 
+        return epoch_losses.numpy()
 
-def summary(samples):
-    site_stats = {}
-    for k, v in samples.items():
-        site_stats[k] = {
-            "mean": torch.mean(v, 0).detach().cpu().numpy(),
-            "std": torch.std(v, 0).detach().cpu().numpy(),
-            "5%": v.kthvalue(int(len(v) * 0.05), dim=0)[0].detach().cpu().numpy(),
-            "95%": v.kthvalue(int(len(v) * 0.95), dim=0)[0].detach().cpu().numpy(),
-        }
-    return site_stats
+    def adapt(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        n_epochs: int,
+        initial_lr: float,
+        final_lr: float,
+    ) -> np.ndarray:
+        self.train()
+
+        if x.size == 0:
+            guide = None
+            epoch_losses = np.array([])
+        else:
+            guide = AutoDiagonalNormal(model=self)
+            epoch_losses = _train_model_svi(
+                model=self,
+                guide=guide,
+                x=torch.tensor(x, dtype=torch.float),
+                y=torch.tensor(y, dtype=torch.float),
+                n_epochs=n_epochs,
+                initial_lr=initial_lr,
+                final_lr=final_lr,
+                alpha_reg=0.0,
+            ).numpy()
+
+        self._guide = guide
+        self.eval()
+
+        return epoch_losses
+
+    @torch.no_grad()
+    def marginal_log_likelihood(
+        self, x: np.ndarray, y: np.ndarray, n_samples: int, guide_choice: str
+    ):
+        guide = self.get_guide(guide=guide_choice)
+        if guide is not None:
+            assert guide.plates["tasks"].size == x.shape[0]
+
+        if x.size > 0:
+            marg_ll = _marginal_log_likelihood(
+                model=self,
+                guide=guide,
+                x=torch.tensor(x, dtype=torch.float),
+                y=torch.tensor(y, dtype=torch.float),
+                n_samples=n_samples,
+            ).numpy()
+        else:
+            marg_ll = np.nan
+
+        return marg_ll
+
+    @torch.no_grad()
+    def predict(self, x: np.ndarray, n_samples: int, guide: str) -> dict:
+        guide = self.get_guide(guide=guide)
+        if guide is not None:
+            assert guide.plates["tasks"].size == x.shape[0], (
+                f"x and guide have different numbers of tasks! "
+                f"x.shape[0] = {x.shape[0]:d}, "
+                f"guide.plates['tasks'].size = {guide.plates['tasks'].size:d}"
+            )
+
+        predictive = Predictive(
+            model=self,
+            guide=guide,
+            num_samples=n_samples,
+            parallel=True,  # our model is vectorized
+            return_sites=(
+                # if model is linear, those sites are available
+                "net.0.weight",
+                "net.0.bias",
+                # those sites are always available
+                "obs",
+                "sigma",
+                "_RETURN",
+            ),
+        )
+        samples = predictive(x=torch.tensor(x, dtype=torch.float), y=None)
+        samples = {k: v.detach().cpu().numpy() for k, v in samples.items()}
+
+        return samples
 
 
 def plot_predictions_for_one_set_of_tasks(
@@ -351,7 +606,7 @@ def plot_predictions_for_one_set_of_tasks(
     plot_obs: bool,
     ax: None,
     max_tasks: int,
-    n_contexts: Optional[np.ndarray] = None,
+    n_context: Optional[np.ndarray] = None,
 ):
     ## prepare data
     means_plt = pred_summary["_RETURN"]["mean"]
@@ -425,11 +680,11 @@ def plot_predictions_for_one_set_of_tasks(
             break
         line = ax.plot(x_pred[l, :], means_plt[l, :])[0]
         ax.scatter(x[l, :], y[l, :], color=line.get_color())
-        if n_contexts is not None:
-            x_context, y_context, _, _ = split_task(
+        if n_context is not None:
+            x_context, y_context, _, _ = split_tasks(
                 x=x[l : l + 1, :][:, :, None],
                 y=y[l : l + 1, :][:, :, None],
-                n_context=n_contexts[l],
+                n_context=n_context,
             )
             ax.scatter(
                 x_context,
@@ -468,11 +723,12 @@ def plot_predictions(
     pred_summary_prior_meta_untrained,
     pred_summary_prior_meta_trained,
     pred_summary_posterior_meta,
-    pred_summary_posterior_test,
+    pred_summaries_posterior_test,
     max_tasks=3,
 ):
-
-    fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(12, 6), sharey=True)
+    fig, axes = plt.subplots(
+        nrows=2, ncols=3 + len(n_contexts_test), figsize=(16, 8), sharey=True
+    )
     fig.suptitle(f"Prior and Posterior Predictions")
 
     ax = axes[0, 0]
@@ -517,20 +773,21 @@ def plot_predictions(
         max_tasks=max_tasks,
     )
 
-    ax = axes[0, 3]
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title("Posterior Mean\n(test data)")
-    plot_predictions_for_one_set_of_tasks(
-        x=x_test,
-        y=y_test,
-        x_pred=x_pred_test,
-        n_contexts=n_contexts_test,
-        pred_summary=pred_summary_posterior_test,
-        ax=ax,
-        plot_obs=False,
-        max_tasks=max_tasks,
-    )
+    for i, n_context in enumerate(n_contexts_test):
+        ax = axes[0, 3 + i]
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title(f"Posterior Mean\n(test data, n_ctx={n_context:d})")
+        plot_predictions_for_one_set_of_tasks(
+            x=x_test,
+            y=y_test,
+            x_pred=x_pred_test,
+            n_context=n_context,
+            pred_summary=pred_summaries_posterior_test[i],
+            ax=ax,
+            plot_obs=False,
+            max_tasks=max_tasks,
+        )
 
     ax = axes[1, 0]
     ax.set_xlabel("x")
@@ -574,20 +831,21 @@ def plot_predictions(
         max_tasks=max_tasks,
     )
 
-    ax = axes[1, 3]
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title("Posterior Observation\n(test data)")
-    plot_predictions_for_one_set_of_tasks(
-        x=x_test,
-        y=y_test,
-        x_pred=x_pred_test,
-        n_contexts=n_contexts_test,
-        pred_summary=pred_summary_posterior_test,
-        ax=ax,
-        plot_obs=True,
-        max_tasks=max_tasks,
-    )
+    for i, n_context in enumerate(n_contexts_test):
+        ax = axes[1, 3 + i]
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title(f"Posterior Observation\n(test data, n_ctx={n_context:d})")
+        plot_predictions_for_one_set_of_tasks(
+            x=x_test,
+            y=y_test,
+            x_pred=x_pred_test,
+            n_context=n_context,
+            pred_summary=pred_summaries_posterior_test[i],
+            ax=ax,
+            plot_obs=True,
+            max_tasks=max_tasks,
+        )
     fig.tight_layout()
 
 
@@ -598,19 +856,26 @@ def plot_distributions(
     samples_prior_meta_untrained,
     samples_prior_meta_trained,
     samples_posterior_meta,
-    samples_posterior_test,
+    samples_posteriors_test,
+    n_contexts_test,
     max_tasks=3,
 ):
-    fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(12, 6), sharex=True)
+    fig, axes = plt.subplots(
+        nrows=1,
+        ncols=3 + len(n_contexts_test),
+        figsize=(12, 6),
+        sharex=True,
+        squeeze=False,
+    )
     fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
 
     n_meta_tasks = samples_prior_meta_untrained[site_name].shape[1]
-    n_test_tasks = samples_posterior_test[site_name].shape[1]
+    n_test_tasks = samples_posteriors_test[0][site_name].shape[1]
 
     for l in range(n_meta_tasks):
         if l == max_tasks:
             break
-        ax = axes[0]
+        ax = axes[0, 0]
         ax.set_title("Prior distribution\n(untrained)")
         sns.distplot(
             samples_prior_meta_untrained[site_name].squeeze()[:, l],
@@ -620,7 +885,7 @@ def plot_distributions(
         if bm_meta_params is not None:
             ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
-        ax = axes[1]
+        ax = axes[0, 1]
         ax.set_title("Prior distribution\n(trained on meta data)")
         sns.distplot(
             samples_prior_meta_trained[site_name].squeeze()[:, l],
@@ -630,7 +895,7 @@ def plot_distributions(
         if bm_meta_params is not None:
             ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
-        ax = axes[2]
+        ax = axes[0, 2]
         ax.set_title("Posterior distribution\n(meta data)")
         sns.distplot(
             samples_posterior_meta[site_name].squeeze()[:, l],
@@ -640,223 +905,60 @@ def plot_distributions(
         if bm_meta_params is not None:
             ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
-    for l in range(n_test_tasks):
-        ax = axes[3]
-        ax.set_title("Posterior distribution\n(test data)")
-        sns.distplot(
-            samples_posterior_test[site_name].squeeze()[:, l],
-            kde_kws={"label": f"Test Task {l}"},
-            ax=ax,
-        )
-        if bm_test_params is not None:
-            ax.axvline(x=bm_test_params[l], color=sns.color_palette()[l])
+    for i, n_context in enumerate(n_contexts_test):
+        for l in range(n_test_tasks):
+            if l == max_tasks:
+                break
+            ax = axes[0, 3 + i]
+            ax.set_title(f"Posterior distribution\n(test data, n_ctx={n_context:d})")
+            sns.distplot(
+                samples_posteriors_test[i][site_name].squeeze()[:, l],
+                kde_kws={"label": f"Test Task {l}"},
+                ax=ax,
+            )
+            if bm_test_params is not None:
+                ax.axvline(x=bm_test_params[l], color=sns.color_palette()[l])
 
-    axes[0].legend()
-    axes[1].legend()
-    axes[2].legend()
-    axes[3].legend()
-    axes[0].set_xlabel(site_name)
-    axes[1].set_xlabel(site_name)
-    axes[2].set_xlabel(site_name)
-    axes[3].set_xlabel(site_name)
+    for ax in axes[0]:
+        ax.legend()
+        ax.set_xlabel(site_name)
     fig.tight_layout()
 
 
-def collate_data(bm: MetaLearningBenchmark):
-    x = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_x))
-    y = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_y))
-    for l, task in enumerate(bm):
-        x[l, :] = task.x
-        y[l, :] = task.y
-    return x, y
-
-
-def print_parameters():
-    first = True
-    for name in pyro.get_param_store().keys():
-        if first:
-            first = False
-        else:
-            print("\n")
-        print(
-            f"name  = {name}"
-            f"\nshape = {pyro.param(name).shape}"
-            f"\nvalue = {pyro.param(name)}"
-        )
-
-
-def freeze_parameters():
-    for name, value in pyro.get_param_store().items():
-        pyro.param[name] = pyro.param[name].detach()
-
-
-def compute_regularizer(model):
-    prior = model.get_prior_distribution()
-    regularizer = torch.tensor(0.0)
-    for prior_factor in prior:
-        assert len(prior_factor.batch_shape) == 0
-        normal = (
-            dist.Normal(0.0, 1.0)
-            .expand(prior_factor.event_shape)
-            .to_event(len(prior_factor.event_shape))
-        )
-        kl = kl_divergence(prior_factor, normal)
-        regularizer = regularizer + kl
-    return regularizer
-
-
-def train_model_custom_loss(
-    model, guide, x, y, n_iter, initial_lr, alpha_reg, final_lr=None
+def plot_metrics(
+    learning_curve_meta, learning_curves_test, lls, lls_context, n_contexts
 ):
-    model.train()
-
-    # get parameters
-    params_model = list(model.parameters())
-    guide(x=torch.tensor(x), y=torch.tensor(y))
-    params_guide = list(guide.parameters())
-    params = params_model + params_guide
-
-    ## optimizer
-    # use the same tweaks as Pyro's ClippedAdam: LR decay and gradient clipping
-    # (gradient clipping is implemented in the training loop itself)
-    optim = AdamTorch(params=params, lr=initial_lr)
-    if final_lr is not None:
-        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
-        lr_decay = gamma ** (1 / n_iter)
-        lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
-    else:
-        lr_scheduler = None
-
-    # loss
-    regularizer_fn = compute_regularizer
-    loss_fn = Trace_ELBO().differentiable_loss
-
-    # training loop
-    train_losses = []
-    for i in range(n_iter):
-        optim.zero_grad()
-        regularizer = regularizer_fn(model=model)
-        elbo = -loss_fn(model=model, guide=guide, x=torch.tensor(x), y=torch.tensor(y))
-        loss = -elbo + alpha_reg * regularizer
-        loss.backward()
-        train_losses.append(loss.item())
-        clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
-        optim.step()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-        if i % 100 == 0 or i == len(range(n_iter)) - 1:
-            print(f"[iter {i:04d}] elbo = {elbo:.4e} | reg = {regularizer:.4e}")
-
-    model.eval()
-
-    return train_losses
-
-
-def compute_log_likelihood(model, guide, x, y, n_samples):
-    """
-    Computes predictive log-likelihood using latent samples from guide using Predictive.
-    """
-    # obtain vectorized model trace
-    x, y = torch.tensor(x), torch.tensor(y)
-    predictive = Predictive(
-        model=model,
-        guide=guide,
-        num_samples=n_samples,
-        parallel=True,
-    )
-    model_trace = predictive.get_vectorized_trace(x=x, y=y)
-
-    # compute log-likelihood for the observation sites
-    obs_site = model_trace.nodes["obs"]
-    log_prob = obs_site["fn"].log_prob(obs_site["value"])  # reduces event-dims
-    n_task = x.shape[0]
-    n_pts = x.shape[1]
-    assert log_prob.shape == (n_samples, n_task, n_pts)
-
-    # compute predictive likelihood
-    log_prob = torch.sum(log_prob, dim=2, keepdim=True)  # sum pts-per-task dim
-    log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # reduce sampledim
-    log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # sum task dim
-    assert log_prob.shape == (1, 1, 1)
-    log_prob = log_prob.squeeze_()
-    log_prob = log_prob - n_task * torch.log(torch.tensor(n_samples))
-
-    # normalize w.r.t. number of datapoints
-    log_prob = log_prob / n_task / n_pts
-
-    return log_prob
-
-
-def stack_pred_summaries_along_task_dim(pred_summaries: List):
-    task_dim = 0  # in the pred_summary, the sample dim is already reduced
-
-    result = {}
-    for pred_summary in pred_summaries:
-        if not result:
-            result = pred_summary
-            continue
-
-        for k0, v0 in pred_summary.items():
-            for k1, v1 in v0.items():
-                result[k0][k1] = np.concatenate((result[k0][k1], v1), axis=task_dim)
-
-    return result
-
-
-def stack_samples_along_task_dim(samples: List):
-    task_dim = 1  # the zeroth dim is the sample dim
-
-    result = {}
-    for sample in samples:
-        if not result:
-            result = sample
-            continue
-
-        for k, v in sample.items():
-            result[k] = np.concatenate((result[k], v), axis=task_dim)
-
-    return result
-
-def train_model(model, guide, x, y, n_iter, initial_lr, final_lr=None):
-    model.train()
-
-    # optimizer
-    optim_args = {}
-    optim_args["lr"] = initial_lr
-    if final_lr is not None:
-        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
-        optim_args["lrd"] = gamma ** (1 / n_iter)
-    optim = ClippedAdam(optim_args=optim_args)
-
-    # SVI
-    svi = SVI(model=model, guide=guide, optim=optim, loss=Trace_ELBO())
-
-    # training loop
-    pyro.clear_param_store()
-    for i in range(n_iter):
-        elbo = -svi.step(x=torch.tensor(x), y=torch.tensor(y))
-        if i % 100 == 0 or i == len(range(n_iter)) - 1:
-            print(f"[iter {i:04d}] elbo = {elbo:.4f}")
-
-    model.eval()
-
-def plot_metrics(train_losses_meta, lls, lls_context, n_contexts):
-    fig, axes = plt.subplots(nrows=1, ncols=2, squeeze=False)
+    fig, axes = plt.subplots(nrows=1, ncols=3, squeeze=False)
     fig.suptitle("Metrics")
 
     ax = axes[0, 0]
-    ax.set_title("Learning Curve")
+    ax.set_title("Learning Curve (meta training)")
     ax.set_xlabel("epoch")
     ax.set_ylabel("loss")
     ax.set_yscale("symlog")  # TODO: think about symlog scaling
-    if train_losses_meta is not None:
+    if learning_curve_meta is not None:
         ax.plot(
-            np.arange(len(train_losses_meta)), train_losses_meta, label="meta training"
+            np.arange(len(learning_curve_meta)),
+            learning_curve_meta,
         )
         ax.legend()
     ax.grid()
 
     ax = axes[0, 1]
+    ax.set_title("Learning Curve (adaptation)")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_yscale("symlog")  # TODO: think about symlog scaling
+    for learning_curve, n_context in zip(learning_curves_test, n_contexts):
+        ax.plot(
+            np.arange(len(learning_curve)),
+            learning_curve,
+            label=f"n_ctx={n_context:d}",
+        )
+    ax.legend()
+    ax.grid()
+
+    ax = axes[0, 2]
     ax.set_title("Marginal Log-Likelihood")
     ax.set_xlabel("n_context")
     ax.set_xticks(n_contexts)
@@ -869,7 +971,16 @@ def plot_metrics(train_losses_meta, lls, lls_context, n_contexts):
     fig.tight_layout()
 
 
-def split_task(x, y, n_context):
+def collate_data(bm: MetaLearningBenchmark):
+    x = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_x))
+    y = np.zeros((bm.n_task, bm.n_points_per_task, bm.d_y))
+    for l, task in enumerate(bm):
+        x[l, :] = task.x
+        y[l, :] = task.y
+    return x, y
+
+
+def split_tasks(x, y, n_context):
     x_context, y_context = x[:, :n_context, :], y[:, :n_context, :]
     # TODO: use all data as target?
     x_target, y_target = x, y
@@ -886,25 +997,27 @@ def main():
     pyro.set_rng_seed(123)
     plot = True
     smoke_test = False
-    # benchmark
-    bm = Quadratic1D
-    n_task_meta = 8
-    n_points_per_task_meta = 16
+    # benchmarks
+    bm = Affine1D
     noise_stddev = 0.01
+    n_tasks_meta = 8
+    n_points_per_task_meta = 16
+    n_tasks_test = 128
+    n_points_per_task_test = 128
     # model
-    n_hidden = 1
+    n_hidden = 0
     d_hidden = 8
     infer_noise_stddev = True
     prior_type = "diagonal"
     # training
-    do_meta_training = False
-    n_iter = 5000 if not smoke_test else 100
+    do_meta_training = True
+    n_epochs = 2000 if not smoke_test else 100
     initial_lr = 0.1
     final_lr = 0.00001
     alpha_reg = 0.0
     # evaluation
     n_contexts = (
-        np.array([0, 1, 2, 5, 10, n_points_per_task_meta])
+        np.array([0, 1, 2, 5, 10, n_points_per_task_test])
         if not smoke_test
         else np.array([0, 5, 10])
     )
@@ -915,7 +1028,7 @@ def main():
     ## create benchmarks
     # meta benchmark
     bm_meta = bm(
-        n_task=n_task_meta,
+        n_task=n_tasks_meta,
         n_datapoints_per_task=n_points_per_task_meta,
         output_noise=noise_stddev,
         seed_task=1234,
@@ -924,22 +1037,24 @@ def main():
     )
     x_meta, y_meta = collate_data(bm=bm_meta)
     x_pred_meta = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(
-        n_task_meta, axis=0
+        n_tasks_meta, axis=0
     )
     # test benchmark
     bm_test = bm(
-        n_task=1,
-        n_datapoints_per_task=n_points_per_task_meta,
+        n_task=n_tasks_test,
+        n_datapoints_per_task=n_points_per_task_test,
         output_noise=noise_stddev,
         seed_task=1235,
         seed_x=1236,
         seed_noise=1237,
     )
     x_test, y_test = collate_data(bm=bm_test)
-    x_pred_test = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(1, axis=0)
+    x_pred_test = np.linspace(-1.5, 1.5, n_pred)[None, :, None].repeat(
+        n_tasks_test, axis=0
+    )
 
-    # create model
-    mtbreg = MTBayesianRegression(
+    ## create model
+    mtbnn = MultiTaskBayesianNeuralNetwork(
         d_x=bm_meta.d_x,
         d_y=bm_meta.d_y,
         n_hidden=n_hidden,
@@ -947,152 +1062,124 @@ def main():
         noise_stddev=None if infer_noise_stddev else noise_stddev,
         prior_type=prior_type,
     )
-    mtbreg.eval()
 
-    ## obtain predictions before meta training
-    with torch.no_grad():
-        pred_summary_prior_meta_untrained, samples_prior_meta_untrained = predict(
-            model=mtbreg, guide=None, x=x_pred_meta, n_samples=n_samples
-        )
-
-    ## print trace shapes
-    print("\n********************")
-    print("*** Trace shapes ***")
-    print("********************")
-    trace = poutine.trace(mtbreg).get_trace(x=torch.tensor(x_pred_meta))
-    trace.compute_log_prob()
-    print(trace.format_shapes())
-    print("********************")
+    ## obtain predictions on meta data before meta training
+    samples_prior_meta_untrained = mtbnn.predict(
+        x=x_pred_meta, n_samples=n_samples, guide="prior"
+    )
+    pred_summary_prior_meta_untrained = summarize_samples(
+        samples=samples_prior_meta_untrained
+    )
 
     ## print prior parameters
     print("\n************************")
     print("*** Prior parameters ***")
     print("************************")
-    print_parameters()
+    mtbnn.print_parameters()
     print("************************")
 
     ## do inference
     print("\n*******************************")
     print("*** Performing inference... ***")
     print("*******************************")
-    # guide_meta = AutoNormal(model=mtblr)
-    guide_meta = AutoDiagonalNormal(model=mtbreg)
-    # guide_meta = AutoMultivariateNormal(model=mtblr)
     if do_meta_training:
-        train_losses_meta = train_model_custom_loss(
-            model=mtbreg,
-            guide=guide_meta,
+        learning_curve_meta = mtbnn.meta_train(
             x=x_meta,
             y=y_meta,
-            n_iter=n_iter,
+            n_epochs=n_epochs,
             initial_lr=initial_lr,
             final_lr=final_lr,
             alpha_reg=alpha_reg,
         )
     else:
-        train_losses_meta = None
+        learning_curve_meta = None
     print("*******************************")
 
     ## print learned parameters
     print("\n****************************")
     print("*** Posterior parameters ***")
     print("****************************")
-    print_parameters()
+    mtbnn.print_parameters()
     print("****************************")
 
-    ## obtain predictions after meta training
+    ## obtain predictions on meta data after training
     # obtain prior predictions
-    pred_summary_prior_meta_trained, samples_prior_meta_trained = predict(
-        model=mtbreg, guide=None, x=x_pred_meta, n_samples=n_samples
+    samples_prior_meta_trained = mtbnn.predict(
+        x=x_pred_meta, n_samples=n_samples, guide="prior"
+    )
+    pred_summary_prior_meta_trained = summarize_samples(
+        samples=samples_prior_meta_trained
     )
     # obtain posterior predictions
-    pred_summary_posterior_meta, samples_posterior_meta = predict(
-        model=mtbreg, guide=guide_meta, x=x_pred_meta, n_samples=n_samples
+    samples_posterior_meta = mtbnn.predict(
+        x=x_pred_meta, n_samples=n_samples, guide="meta"
     )
-
-    # ## freeze prior
-    mtbreg.freeze_prior()
+    pred_summary_posterior_meta = summarize_samples(samples=samples_posterior_meta)
 
     # print freezed parameters
     print("\n**************************************")
     print("*** Posterior parameters (freezed) ***")
     print("**************************************")
-    print_parameters()
+    mtbnn.print_parameters()
     print("**************************************")
 
     ## do inference on test task
     lls = np.zeros(n_contexts.shape)
     lls_context = np.zeros(n_contexts.shape)
-    guides = []
+    pred_summaries_posteriors_test, samples_posteriors_test = [], []
+    learning_curves_test = []
     for i, n_context in enumerate(n_contexts):
         print("\n**************************************************************")
         print(
-            f"*** Performing inference on test task (n_context = {n_context:3d})... ***"
+            f"*** Performing inference on test tasks (n_context = {n_context:3d})... ***"
         )
         print("**************************************************************")
-        x_context, y_context, x_target, y_target = split_task(
+        x_context, y_context, x_target, y_target = split_tasks(
             x=x_test, y=y_test, n_context=n_context
         )
-        if n_context != 0:
-            # we need a new guide
-            # guide_test = AutoNormal(model=mtblr)
-            cur_guide = AutoDiagonalNormal(model=mtbreg)
-            # guide_test = AutoMultivariateNormal(model=mtblr)
-            train_model(
-                model=mtbreg,
-                guide=cur_guide,
+        learning_curves_test.append(
+            mtbnn.adapt(
                 x=x_context,
                 y=y_context,
-                n_iter=n_iter,
+                n_epochs=n_epochs,
                 initial_lr=initial_lr,
                 final_lr=final_lr,
             )
-        else:
-            cur_guide = None
-        guides.append(cur_guide)
-        lls[i] = compute_log_likelihood(
-            model=mtbreg,
-            guide=cur_guide,
+        )
+        lls[i] = mtbnn.marginal_log_likelihood(
             x=x_target,
             y=y_target,
             n_samples=n_samples,
+            guide_choice="test",
         )
-        if n_context != 0:
-            lls_context[i] = compute_log_likelihood(
-                model=mtbreg,
-                guide=cur_guide,
-                x=x_context,
-                y=y_context,
-                n_samples=n_samples,
-            )
-        else:
-            lls_context[i] = np.nan
+        lls_context[i] = mtbnn.marginal_log_likelihood(
+            x=x_context,
+            y=y_context,
+            n_samples=n_samples,
+            guide_choice="test",
+        )
+        cur_samples_posterior_test = mtbnn.predict(
+            x=x_pred_test, n_samples=n_samples, guide="test"
+        )
+        cur_pred_summary_posterior_test = summarize_samples(
+            samples=cur_samples_posterior_test
+        )
+        pred_summaries_posteriors_test.append(cur_pred_summary_posterior_test)
+        samples_posteriors_test.append(cur_samples_posterior_test)
         print("*******************************")
 
     # print freezed parameters (make sure adaptation step did not change them)
     print("\n**************************************")
     print("*** Posterior parameters (freezed) ***")
     print("**************************************")
-    print_parameters()
+    mtbnn.print_parameters()
     print("**************************************")
-
-    # obtain posterior predictions
-    pred_summary_posterior_test, samples_posterior_test = [], []
-    for guide in guides:
-        cur_pred_summary_posterior_test, cur_samples_posterior_test = predict(
-            model=mtbreg, guide=guide, x=x_pred_test, n_samples=n_samples
-        )
-        pred_summary_posterior_test.append(cur_pred_summary_posterior_test)
-        samples_posterior_test.append(cur_samples_posterior_test)
-    pred_summary_posterior_test = stack_pred_summaries_along_task_dim(
-        pred_summary_posterior_test
-    )
-    samples_posterior_test = stack_samples_along_task_dim(samples_posterior_test)
 
     # plot predictions
     if plot:
         plot_metrics(
-            train_losses_meta=train_losses_meta,
+            learning_curve_meta=learning_curve_meta,
+            learning_curves_test=learning_curves_test,
             lls=lls,
             lls_context=lls_context,
             n_contexts=n_contexts,
@@ -1101,16 +1188,14 @@ def main():
             x_meta=x_meta,
             y_meta=y_meta,
             x_pred_meta=x_pred_meta,
-            x_test=np.broadcast_to(x_test, (len(n_contexts),) + x_test.shape[1:]),
-            y_test=np.broadcast_to(y_test, (len(n_contexts),) + y_test.shape[1:]),
-            x_pred_test=np.broadcast_to(
-                x_pred_test, (len(n_contexts),) + x_pred_test.shape[1:]
-            ),
+            x_test=x_test,
+            y_test=y_test,
+            x_pred_test=x_pred_test,
             n_contexts_test=n_contexts,
             pred_summary_prior_meta_untrained=pred_summary_prior_meta_untrained,
             pred_summary_prior_meta_trained=pred_summary_prior_meta_trained,
             pred_summary_posterior_meta=pred_summary_posterior_meta,
-            pred_summary_posterior_test=pred_summary_posterior_test,
+            pred_summaries_posterior_test=pred_summaries_posteriors_test,
             max_tasks=max_plot_tasks,
         )
 
@@ -1120,47 +1205,43 @@ def main():
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 if isinstance(bm_meta, Affine1D):
-                    bm_meta_params = np.zeros(n_task_meta)
+                    bm_meta_params = np.zeros(n_tasks_meta)
+                    bm_test_params = np.zeros(n_tasks_test)
                     for l, task in enumerate(bm_meta):
                         bm_meta_params[l] = task.param[0]
+                    for l, task in enumerate(bm_test):
+                        bm_test_params[l] = task.param[1]
                 else:
-                    bm_meta_params = None
-                if isinstance(bm_test, Affine1D):
-                    bm_test_params = bm_test.get_task_by_index(0).param[0] * np.ones(
-                        len(n_contexts)
-                    )
-                else:
-                    bm_test_params = None
+                    bm_meta_params, bm_test_params = None, None
                 plot_distributions(
-                    site_name="mtbnn.net.0.weight",
+                    site_name="net.0.weight",
                     bm_meta_params=bm_meta_params,
                     bm_test_params=bm_test_params,
                     samples_prior_meta_untrained=samples_prior_meta_untrained,
                     samples_prior_meta_trained=samples_prior_meta_trained,
                     samples_posterior_meta=samples_posterior_meta,
-                    samples_posterior_test=samples_posterior_test,
+                    samples_posteriors_test=samples_posteriors_test,
+                    n_contexts_test=n_contexts,
                 )
 
                 if isinstance(bm_meta, Affine1D):
-                    bm_meta_params = np.zeros(n_task_meta)
+                    bm_meta_params = np.zeros(n_tasks_meta)
+                    bm_test_params = np.zeros(n_tasks_test)
                     for l, task in enumerate(bm_meta):
                         bm_meta_params[l] = task.param[1]
+                    for l, task in enumerate(bm_test):
+                        bm_test_params[l] = task.param[1]
                 else:
-                    bm_meta_params = None
-                if isinstance(bm_test, Affine1D):
-                    bm_test_params = bm_test.get_task_by_index(0).param[1] * np.ones(
-                        len(n_contexts)
-                    )
-                else:
-                    bm_test_params = None
+                    bm_meta_params, bm_test_params = None, None
                 plot_distributions(
-                    site_name="mtbnn.net.0.bias",
+                    site_name="net.0.bias",
                     bm_meta_params=bm_meta_params,
                     bm_test_params=bm_test_params,
                     samples_prior_meta_untrained=samples_prior_meta_untrained,
                     samples_prior_meta_trained=samples_prior_meta_trained,
                     samples_posterior_meta=samples_posterior_meta,
-                    samples_posterior_test=samples_posterior_test,
+                    samples_posteriors_test=samples_posteriors_test,
+                    n_contexts_test=n_contexts,
                 )
 
         plt.show()
