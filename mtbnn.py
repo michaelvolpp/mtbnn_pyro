@@ -82,12 +82,21 @@ def _compute_kl_regularizer(model: PyroModule):
     regularizer = torch.tensor(0.0)
     for prior_factor in prior:
         assert len(prior_factor.batch_shape) == 0
-        normal = (
-            dist.Normal(0.0, 1.0)
-            .expand(prior_factor.event_shape)
-            .to_event(len(prior_factor.event_shape))
-        )
-        kl = kl_divergence(prior_factor, normal)
+        assert prior_factor.event_dim == 1
+        if isinstance(prior_factor.base_dist, dist.Normal):
+            standard_normal = (
+                dist.Normal(0.0, 1.0)
+                .expand(prior_factor.event_shape)
+                .to_event(len(prior_factor.event_shape))
+            )
+        elif isinstance(prior_factor.base_dist, dist.MultivariateNormal):
+            standard_normal = dist.MultivariateNormal(
+                torch.zeros(prior_factor.event_shape),
+                covariance_matrix=torch.eye(prior_factor.event_shape[0]),
+            )
+        else:
+            raise NotImplementedError
+        kl = kl_divergence(prior_factor, standard_normal)
         regularizer = regularizer + kl
     return regularizer
 
@@ -212,7 +221,7 @@ class MultiTaskBayesianLinear(PyroModule):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        prior_type: str = "isotropic",
+        prior_type: str = "isotropic_gaussian",
     ):
         super().__init__()
 
@@ -221,7 +230,7 @@ class MultiTaskBayesianLinear(PyroModule):
         self.prior_type = prior_type
 
         ## weight prior
-        if self.prior_type == "isotropic":
+        if self.prior_type == "isotropic_gaussian":
             self.weight_prior_loc = PyroParam(
                 init_value=torch.tensor(0.0),
                 constraint=constraints.real,
@@ -232,28 +241,40 @@ class MultiTaskBayesianLinear(PyroModule):
             )
             self.weight_prior = (
                 lambda self: dist.Normal(self.weight_prior_loc, self.weight_prior_scale)
-                .expand([self.out_features, self.in_features])
-                .to_event(2)
+                .expand([self.out_features * self.in_features])
+                .to_event(1)
             )
-        elif self.prior_type == "diagonal":
+        elif self.prior_type == "diagonal_gaussian":
             self.weight_prior_loc = PyroParam(
-                init_value=torch.zeros(self.out_features, self.in_features),
+                init_value=torch.zeros(self.out_features * self.in_features),
                 constraint=constraints.real,
             )
             self.weight_prior_scale = PyroParam(
-                init_value=torch.ones(self.out_features, self.in_features),
+                init_value=torch.ones(self.out_features * self.in_features),
                 constraint=constraints.positive,
             )
             self.weight_prior = lambda self: dist.Normal(
                 self.weight_prior_loc, self.weight_prior_scale
-            ).to_event(2)
+            ).to_event(1)
+        elif self.prior_type == "multivariate_gaussian":
+            self.weight_prior_loc = PyroParam(
+                init_value=torch.zeros(self.out_features * self.in_features),
+                constraint=constraints.real,
+            )
+            self.weight_prior_scale_tril = PyroParam(
+                init_value=torch.eye(self.out_features * self.in_features),
+                constraint=constraints.lower_cholesky,
+            )
+            self.weight_prior = lambda self: dist.MultivariateNormal(
+                loc=self.weight_prior_loc, scale_tril=self.weight_prior_scale_tril
+            )  # already has event_dim == 1
         else:
             raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
         self.weight = PyroSample(self.weight_prior)
 
         ## bias prior
         if bias:
-            if self.prior_type == "isotropic":
+            if self.prior_type == "isotropic_gaussian":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.tensor(0.0),
                     constraint=constraints.real,
@@ -267,7 +288,7 @@ class MultiTaskBayesianLinear(PyroModule):
                     .expand([self.out_features])
                     .to_event(1)
                 )
-            elif self.prior_type == "diagonal":
+            elif self.prior_type == "diagonal_gaussian":
                 self.bias_prior_loc = PyroParam(
                     init_value=torch.zeros(self.out_features),
                     constraint=constraints.real,
@@ -279,6 +300,18 @@ class MultiTaskBayesianLinear(PyroModule):
                 self.bias_prior = lambda self: dist.Normal(
                     self.bias_prior_loc, self.bias_prior_scale
                 ).to_event(1)
+            elif self.prior_type == "multivariate_gaussian":
+                self.bias_prior_loc = PyroParam(
+                    init_value=torch.zeros(self.out_features),
+                    constraint=constraints.real,
+                )
+                self.bias_prior_scale_tril = PyroParam(
+                    init_value=torch.eye(self.out_features),
+                    constraint=constraints.lower_cholesky,
+                )
+                self.bias_prior = lambda self: dist.MultivariateNormal(
+                    loc=self.bias_prior_loc, scale_tril=self.bias_prior_scale_tril
+                )  # already has event_dim == 1
             else:
                 raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
             self.bias = PyroSample(self.bias_prior)
@@ -286,13 +319,16 @@ class MultiTaskBayesianLinear(PyroModule):
             self.bias = None
 
     def forward(self, x: torch.tensor) -> torch.tensor:
-        weight, bias = self.weight, self.bias  # we will create views below
+        weight, bias = self.weight, self.bias
+        weight = weight.reshape(
+            tuple(weight.shape[:-1]) + (self.out_features, self.in_features)
+        )
 
         ## check shapes
         # weight.event_shape == (self.out_features, self.in_features)
         # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
         #  by Predictive)
-        has_sample_dim = len(self.weight.shape) == 5
+        has_sample_dim = len(weight.shape) == 5
         if not has_sample_dim:
             # add sample dim
             n_samples = 1
