@@ -410,12 +410,21 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 init_value=torch.eye(self._bnn.size_b),
                 constraint=constraints.lower_cholesky,
             )
-            prior_wb = lambda self: dist.MultivariateNormal(
-                self.prior_wb_loc,
-                scale_tril=torch.block_diag(
+            self.prior_wb_scale_tril = PyroParam(
+                init_value=lambda: torch.block_diag(
                     self.prior_w_scale_tril,
                     self.prior_b_scale_tril,
-                ),
+                )
+            )
+            # vs. 
+            # self.prior_wb_scale_tril = torch.block_diag(
+            #     self.prior_w_scale_tril, self.prior_b_scale_tril
+            # )
+            # vs. 
+            # dist.MultivariateNormal(..., scale_tril=torch.block_diag...)
+            # vs. old code -> cf. results
+            prior_wb = lambda self: dist.MultivariateNormal(
+                self.prior_wb_loc, scale_tril=self.prior_wb_scale_tril
             )
             return prior_wb
 
