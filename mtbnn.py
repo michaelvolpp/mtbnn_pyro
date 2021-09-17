@@ -53,40 +53,17 @@ def _create_batched_bnn(
     return net
 
 
-def _compute_kl_regularizer(model: PyroModule):
-    # TODO: make prior a proper distribution, not a list of factor distributions!
-    prior = model.get_prior_distribution()
-    regularizer = torch.tensor(0.0)
-    for prior_factor in prior:
-        assert len(prior_factor.batch_shape) == 0
-        assert prior_factor.event_dim == 1
-        if isinstance(prior_factor.base_dist, dist.Normal):
-            standard_normal = (
-                dist.Normal(0.0, 1.0)
-                .expand(prior_factor.event_shape)
-                .to_event(len(prior_factor.event_shape))
-            )
-        elif isinstance(prior_factor.base_dist, dist.MultivariateNormal):
-            standard_normal = dist.MultivariateNormal(
-                torch.zeros(prior_factor.event_shape),
-                covariance_matrix=torch.eye(prior_factor.event_shape[0]),
-            )
-        else:
-            raise NotImplementedError
-        kl = kl_divergence(prior_factor, standard_normal)
-        regularizer = regularizer + kl
-    return regularizer
-
-
 def _compute_kl_regularizer(model: PyroModule) -> torch.tensor:
     def _compute_kl_to_standard_normal(distribution) -> torch.tensor:
-        if isinstance(distribution.base_dist, dist.Normal):
+        if hasattr(distribution, "base_dist") and isinstance(
+            distribution.base_dist, dist.Normal
+        ):
             standard_normal = (
                 dist.Normal(0.0, 1.0)
                 .expand(distribution.event_shape)
                 .to_event(len(distribution.event_shape))
             )
-        elif isinstance(distribution.base_dist, dist.MultivariateNormal):
+        elif isinstance(distribution, dist.MultivariateNormal):
             standard_normal = dist.MultivariateNormal(
                 torch.zeros(distribution.event_shape),
                 covariance_matrix=torch.eye(distribution.event_shape[0]),
@@ -216,15 +193,14 @@ def _broadcast_xwb(
     n_tasks = x.shape[0]
     n_points = x.shape[1]
     assert w.ndim == 3 or w.ndim == 4
+    has_sample_dim = w.ndim == 4
     assert w.ndim == b.ndim
     assert w.shape[-2] == b.shape[-2] == 1  # singleton pts-dim present due to plates
-    has_sample_dim = w.ndim == 4
     n_samples = w.shape[0] if has_sample_dim else 1
 
     if has_sample_dim:
         ## add sample dim
         x = x[None, ...]
-        w = w[None, ...] if not has_sample_dim else w
 
         ## broadcast
         x = x.expand([n_samples, n_tasks, n_points, -1])
