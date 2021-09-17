@@ -34,8 +34,7 @@ def main():
     n_hidden = 1
     d_hidden = 8
     infer_noise_stddev = True
-    # prior_type = "multivariate_gaussian"
-    prior_type = "diagonal_gaussian"
+    prior_type = "multivariate_normal"
     # training
     do_meta_training = True
     n_epochs = 5000 if not smoke_test else 100

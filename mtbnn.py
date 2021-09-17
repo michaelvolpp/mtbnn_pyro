@@ -2,7 +2,7 @@
 Implementation of a multi-task Bayesian neural network.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import pyro
@@ -18,60 +18,37 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam as AdamTorch
 from torch.optim.lr_scheduler import ExponentialLR
 
-### PyroNotes:
-## Learned PyroParams
-# https://docs.pyro.ai/en/dev/nn.html#pyro.nn.module.PyroSample
-# https://forum.pyro.ai/t/getting-estimates-of-parameters-that-use-pyrosample/2901/2
-## Plates with explicit independent dimensions
-# https://pyro.ai/examples/tensor_shapes.html#Declaring-independent-dims-with-plate
+_allowed_prior_types = [
+    "isotropic_normal",
+    "factorized_normal",
+    "multivariate_normal",
+    "multivariate_inter_layer_normal",
+]
 
 
-def _create_mtbnn_module(
-    d_x: int, d_y: int, n_hidden: int, d_hidden: int, prior_type: str
+def _create_batched_bnn(
+    d_x: int,
+    d_y: int,
+    n_hidden: int,
+    d_hidden: int,
 ) -> PyroModule:
-
     """
     Generate a multi-task Bayesian neural network Pyro module.
     """
-    modules = []
-    if n_hidden == 0:
-        modules.append(
-            MultiTaskBayesianLinear(
-                in_features=d_x,
-                out_features=d_y,
-                bias=True,
-                prior_type=prior_type,
-            )
-        )
-    else:
-        modules.append(
-            MultiTaskBayesianLinear(
-                in_features=d_x,
-                out_features=d_hidden,
-                bias=True,
-                prior_type=prior_type,
-            )
-        )
-        modules.append(PyroModule[nn.Tanh]())
+
+    layers = []
+    if n_hidden == 0:  # linear model
+        layers.append(PyroModule[BatchedLinear](in_features=d_x, out_features=d_y))
+    else:  # fully connected MLP
+        layers.append(PyroModule[BatchedLinear](in_features=d_x, out_features=d_hidden))
+        layers.append(PyroModule[nn.Tanh]())
         for _ in range(n_hidden - 1):
-            modules.append(
-                MultiTaskBayesianLinear(
-                    in_features=d_hidden,
-                    out_features=d_hidden,
-                    bias=True,
-                    prior_type=prior_type,
-                )
+            layers.append(
+                PyroModule[BatchedLinear](in_features=d_hidden, out_features=d_hidden)
             )
-            modules.append(PyroModule[nn.Tanh]())
-        modules.append(
-            MultiTaskBayesianLinear(
-                in_features=d_hidden,
-                out_features=d_y,
-                bias=True,
-                prior_type=prior_type,
-            )
-        )
-    net = PyroModule[nn.Sequential](*modules)
+            layers.append(PyroModule[nn.Tanh]())
+        layers.append(PyroModule[BatchedLinear](in_features=d_hidden, out_features=d_y))
+    net = PyroModule[BatchedSequential](*layers)
 
     return net
 
@@ -98,6 +75,31 @@ def _compute_kl_regularizer(model: PyroModule):
             raise NotImplementedError
         kl = kl_divergence(prior_factor, standard_normal)
         regularizer = regularizer + kl
+    return regularizer
+
+
+def _compute_kl_regularizer(model: PyroModule) -> torch.tensor:
+    def _compute_kl_to_standard_normal(distribution) -> torch.tensor:
+        if isinstance(distribution.base_dist, dist.Normal):
+            standard_normal = (
+                dist.Normal(0.0, 1.0)
+                .expand(distribution.event_shape)
+                .to_event(len(distribution.event_shape))
+            )
+        elif isinstance(distribution.base_dist, dist.MultivariateNormal):
+            standard_normal = dist.MultivariateNormal(
+                torch.zeros(distribution.event_shape),
+                covariance_matrix=torch.eye(distribution.event_shape[0]),
+            )
+        else:
+            raise NotImplementedError
+
+        return kl_divergence(distribution, standard_normal)
+
+    kl_weight = _compute_kl_to_standard_normal(model.prior_weight)
+    kl_bias = _compute_kl_to_standard_normal(model.prior_bias)
+    regularizer = kl_weight + kl_bias
+
     return regularizer
 
 
@@ -139,12 +141,7 @@ def _train_model_svi(
         optim.zero_grad()
 
         # compute loss
-        elbo = -loss_fn(
-            model=model,
-            guide=guide,
-            x=x,
-            y=y,
-        )
+        elbo = -loss_fn(model=model, guide=guide, x=x, y=y)
         loss = -elbo
 
         # add regularizer
@@ -209,184 +206,129 @@ def _marginal_log_likelihood(
     return log_prob
 
 
-class MultiTaskBayesianLinear(PyroModule):
+def _broadcast_xwb(
+    x: torch.tensor,
+    w: torch.tensor,
+    b: torch.tensor,
+) -> Union[torch.tensor, torch.tensor, torch.tensor]:
+    ## check inputs
+    assert x.ndim == 3
+    n_tasks = x.shape[0]
+    n_points = x.shape[1]
+    assert w.ndim == 3 or w.ndim == 4
+    assert w.ndim == b.ndim
+    assert w.shape[-2] == b.shape[-2] == 1  # singleton pts-dim present due to plates
+    has_sample_dim = w.ndim == 4
+    n_samples = w.shape[0] if has_sample_dim else 1
+
+    if has_sample_dim:
+        ## add sample dim
+        x = x[None, ...]
+        w = w[None, ...] if not has_sample_dim else w
+
+        ## broadcast
+        x = x.expand([n_samples, n_tasks, n_points, -1])
+        w = w.expand([n_samples, n_tasks, n_points, -1])
+        b = b.expand([n_samples, n_tasks, n_points, -1])
+    else:
+        ## broadcast
+        x = x.expand([n_tasks, n_points, -1])
+        w = w.expand([n_tasks, n_points, -1])
+        b = b.expand([n_tasks, n_points, -1])
+
+    return x, w, b
+
+
+class BatchedSequential(nn.Sequential):
     """
-    A multi-task Bayesian linear layer.
-    TODO: adapt for variable numbers of batch dimensions
-          -> use also for single-task case.
+    A container akin to nn.Sequential supporting BatchedLinear layers.
+    """
+
+    def __init__(
+        self,
+        *args,
+    ):
+        super().__init__(*args)
+
+    @property
+    def size_w(self):
+        size = 0
+        for module in self:
+            if isinstance(module, BatchedLinear):
+                size += module.size_w
+        return size
+
+    @property
+    def size_b(self):
+        size = 0
+        for module in self:
+            if isinstance(module, BatchedLinear):
+                size += module.size_b
+        return size
+
+    def forward(
+        self, x: torch.tensor, w: torch.tensor, b: torch.tensor
+    ) -> torch.tensor:
+        w_pos, b_pos = 0, 0
+        for module in self:
+            if isinstance(module, BatchedLinear):
+                x = module(
+                    x=x,
+                    w=w[..., w_pos : w_pos + module.size_w],
+                    b=b[..., b_pos : b_pos + module.size_b] if b is not None else None,
+                )
+                w_pos += module.size_w
+                b_pos += module.size_b
+            else:
+                x = module(x)
+
+        assert w_pos == self.size_w
+        if b is not None:
+            assert b_pos == self.size_b
+
+        return x
+
+
+class BatchedLinear(nn.Module):
+    """
+    A linear layer with batched weights and bias.
     """
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        bias: bool = True,
-        prior_type: str = "isotropic_gaussian",
     ):
         super().__init__()
 
         self.in_features = in_features
         self.out_features = out_features
-        self.prior_type = prior_type
+        self.size_w = self.in_features * self.out_features
+        self.size_b = self.out_features
 
-        ## weight prior
-        if self.prior_type == "isotropic_gaussian":
-            self.weight_prior_loc = PyroParam(
-                init_value=torch.tensor(0.0),
-                constraint=constraints.real,
-            )
-            self.weight_prior_scale = PyroParam(
-                init_value=torch.tensor(1.0),
-                constraint=constraints.positive,
-            )
-            self.weight_prior = (
-                lambda self: dist.Normal(self.weight_prior_loc, self.weight_prior_scale)
-                .expand([self.out_features * self.in_features])
-                .to_event(1)
-            )
-        elif self.prior_type == "diagonal_gaussian":
-            self.weight_prior_loc = PyroParam(
-                init_value=torch.zeros(self.out_features * self.in_features),
-                constraint=constraints.real,
-            )
-            self.weight_prior_scale = PyroParam(
-                init_value=torch.ones(self.out_features * self.in_features),
-                constraint=constraints.positive,
-            )
-            self.weight_prior = lambda self: dist.Normal(
-                self.weight_prior_loc, self.weight_prior_scale
-            ).to_event(1)
-        elif self.prior_type == "multivariate_gaussian":
-            self.weight_prior_loc = PyroParam(
-                init_value=torch.zeros(self.out_features * self.in_features),
-                constraint=constraints.real,
-            )
-            self.weight_prior_scale_tril = PyroParam(
-                init_value=torch.eye(self.out_features * self.in_features),
-                constraint=constraints.lower_cholesky,
-            )
-            self.weight_prior = lambda self: dist.MultivariateNormal(
-                loc=self.weight_prior_loc, scale_tril=self.weight_prior_scale_tril
-            )  # already has event_dim == 1
-        else:
-            raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
-        self.weight = PyroSample(self.weight_prior)
+    def forward(
+        self,
+        x: torch.tensor,
+        w: torch.tensor,
+        b: Optional[torch.tensor] = None,
+    ) -> torch.tensor:
+        ## reshape weight vector to a weight matrix
+        w = w.reshape(tuple(w.shape[:-1]) + (self.out_features, self.in_features))
 
-        ## bias prior
-        if bias:
-            if self.prior_type == "isotropic_gaussian":
-                self.bias_prior_loc = PyroParam(
-                    init_value=torch.tensor(0.0),
-                    constraint=constraints.real,
-                )
-                self.bias_prior_scale = PyroParam(
-                    init_value=torch.tensor(1.0),
-                    constraint=constraints.positive,
-                )
-                self.bias_prior = (
-                    lambda self: dist.Normal(self.bias_prior_loc, self.bias_prior_scale)
-                    .expand([self.out_features])
-                    .to_event(1)
-                )
-            elif self.prior_type == "diagonal_gaussian":
-                self.bias_prior_loc = PyroParam(
-                    init_value=torch.zeros(self.out_features),
-                    constraint=constraints.real,
-                )
-                self.bias_prior_scale = PyroParam(
-                    init_value=torch.ones(self.out_features),
-                    constraint=constraints.positive,
-                )
-                self.bias_prior = lambda self: dist.Normal(
-                    self.bias_prior_loc, self.bias_prior_scale
-                ).to_event(1)
-            elif self.prior_type == "multivariate_gaussian":
-                self.bias_prior_loc = PyroParam(
-                    init_value=torch.zeros(self.out_features),
-                    constraint=constraints.real,
-                )
-                self.bias_prior_scale_tril = PyroParam(
-                    init_value=torch.eye(self.out_features),
-                    constraint=constraints.lower_cholesky,
-                )
-                self.bias_prior = lambda self: dist.MultivariateNormal(
-                    loc=self.bias_prior_loc, scale_tril=self.bias_prior_scale_tril
-                )  # already has event_dim == 1
-            else:
-                raise ValueError(f"Unknown prior specification '{self.prior_type}'!")
-            self.bias = PyroSample(self.bias_prior)
-        else:
-            self.bias = None
+        ## check dimensions
+        assert x.ndim == w.ndim - 1
+        assert x.shape[:-1] == w.shape[:-2]  # same batch dimensions
+        if b is not None:
+            assert x.ndim == b.ndim
+            assert x.shape[:-1] == b.shape[:-1]  # same batch dimensions
+            assert b.shape[-1] == w.shape[-2]  # b and w are compatible
 
-    def forward(self, x: torch.tensor) -> torch.tensor:
-        weight, bias = self.weight, self.bias
-        weight = weight.reshape(
-            tuple(weight.shape[:-1]) + (self.out_features, self.in_features)
-        )
+        ## compute the output
+        h = torch.einsum("...hx,...x->...h", w, x)
+        if b is not None:
+            h = h + b
 
-        ## check shapes
-        # weight.event_shape == (self.out_features, self.in_features)
-        # weight.batch_shape depends on whether a sample dimension is added, (e.g.,
-        #  by Predictive)
-        has_sample_dim = len(weight.shape) == 5
-        if not has_sample_dim:
-            # add sample dim
-            n_samples = 1
-            weight = weight[None, :, :, :, :]
-        else:
-            n_samples = weight.shape[0]
-
-        # x.shape = (n_tasks, n_points, d_x) for the input layer
-        # x.shape = (n_samples, n_tasks, n_points, d_layer) for hidden layers
-        if x.ndim == 3:  # input layer
-            n_tasks = x.shape[0]
-            n_points = x.shape[1]
-            # expand x to sample shape
-            x_expd = x.expand(torch.Size([n_samples]) + x.shape)
-            x_expd = x_expd.float()
-        else:
-            assert x.ndim == 4
-            n_tasks = x.shape[1]
-            n_points = x.shape[2]
-            x_expd = x
-
-        assert x_expd.shape == (n_samples, n_tasks, n_points, self.in_features)
-        assert weight.shape == (
-            n_samples,
-            n_tasks,
-            1,  # because the n_pts plate is nested inside of the n_tsk plate
-            self.out_features,
-            self.in_features,
-        )
-        # squeeze n_pts batch dimension
-        weight = weight.squeeze(2)
-
-        ## compute the linear transformation
-        y = torch.einsum("slyx,slnx->slny", weight, x_expd)
-
-        if bias is not None:
-            ## check shapes
-            # bias.event_shape = (self.out_features)
-            # bias.batch_shape = (n_tasks, 1) or (n_samples, n_tasks, 1) (cf. above)
-            if not has_sample_dim:
-                # add sample dim
-                bias = bias[None, :, :, :]
-            assert bias.shape == (n_samples, n_tasks, 1, self.out_features)
-            # squeeze the n_pts batch dimension
-            bias = bias.squeeze(2)
-            assert bias.shape == (n_samples, n_tasks, self.out_features)
-
-            ## add the bias
-            y = y + bias[:, :, None, :]
-
-        if not has_sample_dim:
-            # if we do not have a sample dimension, we must not return one
-            y.squeeze_(0)
-
-        return y
-
-    def get_prior_distribution(self) -> List:
-        return [self.weight_prior(self), self.bias_prior(self)]
+        return h
 
 
 class MultiTaskBayesianNeuralNetwork(PyroModule):
@@ -406,24 +348,23 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         super().__init__()
 
         ## the mean network
-        self.net = _create_mtbnn_module(
+        self._bnn = _create_batched_bnn(
             d_x=d_x,
             d_y=d_y,
             n_hidden=n_hidden,
             d_hidden=d_hidden,
-            prior_type=prior_type,
         )
 
-        ## noise stddev
+        ## latent variables
+        self._prior_weight, self._prior_bias = self._create_bnn_priors(prior_type)
+        self._weight = PyroSample(self._prior_weight)
+        self._bias = PyroSample(self._prior_bias)
         # TODO: learn noise prior?
-        self.noise_stddev_prior = (
-            dist.Uniform(0.0, 1.0) if noise_stddev is None else None
-        )
-        self.noise_stddev = (
-            PyroSample(self.noise_stddev_prior)
-            if noise_stddev is None
-            else noise_stddev
-        )
+        if noise_stddev is None:
+            self._prior_noise_stddev = dist.Uniform(0.0, 1.0)
+            self._noise_stddev = PyroSample(self._prior_noise_stddev)
+        else:
+            self._noise_stddev = noise_stddev
 
         ## the guides
         self._meta_guide = None
@@ -432,6 +373,91 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         ## set evaluation mode
         self.freeze_prior()
         self.eval()
+
+    def _create_bnn_priors(self, type) -> dist.Distribution:
+        assert type in _allowed_prior_types
+
+        if type == "isotropic_normal":
+            self.prior_weight_loc = PyroParam(
+                init_value=torch.tensor(0.0),
+                constraint=constraints.real,
+            )
+            self.prior_weight_scale = PyroParam(
+                init_value=torch.tensor(1.0),
+                constraint=constraints.positive,
+            )
+            prior_weight = (
+                lambda self: dist.Normal(self.prior_weight_loc, self.prior_weight_scale)
+                .expand([self._bnn.size_w])
+                .to_event(1)
+            )
+
+            self.prior_bias_loc = PyroParam(
+                init_value=torch.tensor(0.0),
+                constraint=constraints.real,
+            )
+            self.prior_bias_scale = PyroParam(
+                init_value=torch.tensor(1.0),
+                constraint=constraints.positive,
+            )
+            prior_bias = (
+                lambda self: dist.Normal(self.prior_bias_loc, self.prior_bias_scale)
+                .expand([self._bnn.size_b])
+                .to_event(1)
+            )
+            return prior_weight, prior_bias
+
+        if type == "factorized_normal":
+            self.prior_weight_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w),
+                constraint=constraints.real,
+            )
+            self.prior_weight_scale = PyroParam(
+                init_value=torch.ones(self._bnn.size_w),
+                constraint=constraints.positive,
+            )
+            prior_weight = lambda self: dist.Normal(
+                self.prior_weight_loc, self.prior_weight_scale
+            ).to_event(1)
+
+            self.prior_bias_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_b),
+                constraint=constraints.real,
+            )
+            self.prior_bias_scale = PyroParam(
+                init_value=torch.ones(self._bnn.size_b),
+                constraint=constraints.positive,
+            )
+            prior_bias = lambda self: dist.Normal(
+                self.prior_bias_loc, self.prior_bias_scale
+            ).to_event(1)
+            return prior_weight, prior_bias
+
+        if type == "multivariate_normal":
+            self.prior_weight_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w),
+                constraint=constraints.real,
+            )
+            self.prior_weight_scale_tril = PyroParam(
+                init_value=torch.eye(self._bnn.size_w),
+                constraint=constraints.lower_cholesky,
+            )
+            prior_weight = lambda self: dist.MultivariateNormal(
+                self.prior_weight_loc, scale_tril=self.prior_weight_scale_tril
+            )
+
+            self.prior_bias_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_b),
+                constraint=constraints.real,
+            )
+            self.prior_bias_scale_tril = PyroParam(
+                init_value=torch.eye(self._bnn.size_b),
+                constraint=constraints.lower_cholesky,
+            )
+            prior_bias = lambda self: dist.MultivariateNormal(
+                self.prior_bias_loc, scale_tril=self.prior_bias_scale_tril
+            )
+            return prior_weight, prior_bias
 
     def freeze_prior(self) -> None:
         """
@@ -451,12 +477,13 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         for p in self.parameters():
             p.requires_grad = True
 
-    def get_prior_distribution(self) -> List:
-        prior_distribution = []
-        for module in self.net:
-            if hasattr(module, "get_prior_distribution"):
-                prior_distribution += module.get_prior_distribution()
-        return prior_distribution
+    @property
+    def prior_weight(self) -> dist.Distribution:
+        return self._prior_weight(self)
+
+    @property
+    def prior_bias(self) -> dist.Distribution:
+        return self._prior_bias(self)
 
     def forward(
         self, x: torch.tensor, y: Optional[torch.tensor] = None
@@ -468,9 +495,15 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         n_tasks = x.shape[0]
         n_points = x.shape[1]
 
-        noise_stddev = self.noise_stddev  # (sample) noise stddev
+        noise_stddev = self._noise_stddev  # (sample) noise stddev
         with pyro.plate("tasks", n_tasks, dim=-2):
-            mean = self.net(x)  # sample weights and compute mean pred
+            # sample weights and biases
+            w = self._weight
+            b = self._bias
+            # add samples- and tasks-dim
+            x, w, b = _broadcast_xwb(x=x, w=w, b=b)
+            mean = self._bnn(x=x, w=w, b=b)
+
             if noise_stddev.nelement() > 1:
                 # noise stddev can have a sample dimension! -> expand to mean's shape
                 noise_stddev = noise_stddev.reshape([-1] + [1] * (mean.ndim - 1))
