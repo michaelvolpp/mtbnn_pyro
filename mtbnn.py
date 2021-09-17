@@ -21,8 +21,9 @@ from torch.optim.lr_scheduler import ExponentialLR
 _allowed_prior_types = [
     "isotropic_normal",
     "factorized_normal",
+    "diagonal_multivariate_normal",
+    "block_diagonal_multivariate_normal",
     "multivariate_normal",
-    "multivariate_inter_layer_normal",
 ]
 
 
@@ -73,11 +74,9 @@ def _compute_kl_regularizer(model: PyroModule) -> torch.tensor:
 
         return kl_divergence(distribution, standard_normal)
 
-    kl_weight = _compute_kl_to_standard_normal(model.prior_weight)
-    kl_bias = _compute_kl_to_standard_normal(model.prior_bias)
-    regularizer = kl_weight + kl_bias
+    kl = _compute_kl_to_standard_normal(model.prior_wb)
 
-    return regularizer
+    return kl
 
 
 def _train_model_svi(
@@ -332,9 +331,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         )
 
         ## latent variables
-        self._prior_weight, self._prior_bias = self._create_bnn_priors(prior_type)
-        self._weight = PyroSample(self._prior_weight)
-        self._bias = PyroSample(self._prior_bias)
+        self._prior_wb = self._create_bnn_priors(prior_type)
+        self._wb = PyroSample(self._prior_wb)
         # TODO: learn noise prior?
         if noise_stddev is None:
             self._prior_noise_stddev = dist.Uniform(0.0, 1.0)
@@ -354,86 +352,86 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         assert type in _allowed_prior_types
 
         if type == "isotropic_normal":
-            self.prior_weight_loc = PyroParam(
+            self.prior_wb_loc = PyroParam(
                 init_value=torch.tensor(0.0),
                 constraint=constraints.real,
             )
-            self.prior_weight_scale = PyroParam(
+            self.prior_wb_scale = PyroParam(
                 init_value=torch.tensor(1.0),
                 constraint=constraints.positive,
             )
-            prior_weight = (
-                lambda self: dist.Normal(self.prior_weight_loc, self.prior_weight_scale)
-                .expand([self._bnn.size_w])
+            prior_wb = (
+                lambda self: dist.Normal(self.prior_wb_loc, self.prior_wb_scale)
+                .expand([self._bnn.size_w + self._bnn.size_b])
                 .to_event(1)
             )
-
-            self.prior_bias_loc = PyroParam(
-                init_value=torch.tensor(0.0),
-                constraint=constraints.real,
-            )
-            self.prior_bias_scale = PyroParam(
-                init_value=torch.tensor(1.0),
-                constraint=constraints.positive,
-            )
-            prior_bias = (
-                lambda self: dist.Normal(self.prior_bias_loc, self.prior_bias_scale)
-                .expand([self._bnn.size_b])
-                .to_event(1)
-            )
-            return prior_weight, prior_bias
+            return prior_wb
 
         if type == "factorized_normal":
-            self.prior_weight_loc = PyroParam(
-                init_value=torch.zeros(self._bnn.size_w),
+            self.prior_wb_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
             )
-            self.prior_weight_scale = PyroParam(
-                init_value=torch.ones(self._bnn.size_w),
+            self.prior_wb_scale = PyroParam(
+                init_value=torch.ones(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.positive,
             )
-            prior_weight = lambda self: dist.Normal(
-                self.prior_weight_loc, self.prior_weight_scale
+            prior_wb = lambda self: dist.Normal(
+                self.prior_wb_loc, self.prior_wb_scale
             ).to_event(1)
 
-            self.prior_bias_loc = PyroParam(
-                init_value=torch.zeros(self._bnn.size_b),
+            return prior_wb
+
+        if type == "diagonal_multivariate_normal":
+            self.prior_wb_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
             )
-            self.prior_bias_scale = PyroParam(
-                init_value=torch.ones(self._bnn.size_b),
+            self.prior_wb_scale_diagonal = PyroParam(
+                init_value=torch.ones(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.positive,
             )
-            prior_bias = lambda self: dist.Normal(
-                self.prior_bias_loc, self.prior_bias_scale
-            ).to_event(1)
-            return prior_weight, prior_bias
+            prior_wb = lambda self: dist.MultivariateNormal(
+                self.prior_wb_loc,
+                scale_tril=torch.diag(self.prior_wb_scale_diagonal),
+            )
+            return prior_wb
 
-        if type == "multivariate_normal":
-            self.prior_weight_loc = PyroParam(
-                init_value=torch.zeros(self._bnn.size_w),
+        if type == "block_diagonal_multivariate_normal":
+            self.prior_wb_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
             )
-            self.prior_weight_scale_tril = PyroParam(
+            self.prior_w_scale_tril = PyroParam(
                 init_value=torch.eye(self._bnn.size_w),
                 constraint=constraints.lower_cholesky,
             )
-            prior_weight = lambda self: dist.MultivariateNormal(
-                self.prior_weight_loc, scale_tril=self.prior_weight_scale_tril
-            )
-
-            self.prior_bias_loc = PyroParam(
-                init_value=torch.zeros(self._bnn.size_b),
-                constraint=constraints.real,
-            )
-            self.prior_bias_scale_tril = PyroParam(
+            self.prior_b_scale_tril = PyroParam(
                 init_value=torch.eye(self._bnn.size_b),
                 constraint=constraints.lower_cholesky,
             )
-            prior_bias = lambda self: dist.MultivariateNormal(
-                self.prior_bias_loc, scale_tril=self.prior_bias_scale_tril
+            prior_wb = lambda self: dist.MultivariateNormal(
+                self.prior_wb_loc,
+                scale_tril=torch.block_diag(
+                    self.prior_w_scale_tril,
+                    self.prior_b_scale_tril,
+                ),
             )
-            return prior_weight, prior_bias
+            return prior_wb
+
+        if type == "multivariate_normal":
+            self.prior_wb_loc = PyroParam(
+                init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
+                constraint=constraints.real,
+            )
+            self.prior_wb_scale_tril = PyroParam(
+                init_value=torch.eye(self._bnn.size_w + self._bnn.size_b),
+                constraint=constraints.lower_cholesky,
+            )
+            prior_wb = lambda self: dist.MultivariateNormal(
+                self.prior_wb_loc, scale_tril=self.prior_wb_scale_tril
+            )
+            return prior_wb
 
     def freeze_prior(self) -> None:
         """
@@ -454,12 +452,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             p.requires_grad = True
 
     @property
-    def prior_weight(self) -> dist.Distribution:
-        return self._prior_weight(self)
-
-    @property
-    def prior_bias(self) -> dist.Distribution:
-        return self._prior_bias(self)
+    def prior_wb(self) -> dist.Distribution:
+        return self._prior_wb(self)
 
     def forward(
         self, x: torch.tensor, y: Optional[torch.tensor] = None
@@ -474,8 +468,9 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         noise_stddev = self._noise_stddev  # (sample) noise stddev
         with pyro.plate("tasks", n_tasks, dim=-2):
             # sample weights and biases
-            w = self._weight
-            b = self._bias
+            wb = self._wb
+            w = wb[..., : self._bnn.size_w]
+            b = wb[..., self._bnn.size_w :]
             # add samples- and tasks-dim
             x, w, b = _broadcast_xwb(x=x, w=w, b=b)
             mean = self._bnn(x=x, w=w, b=b)
