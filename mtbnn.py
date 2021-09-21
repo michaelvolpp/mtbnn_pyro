@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import ExponentialLR
 _allowed_prior_types = [
     "isotropic_normal",
     "factorized_normal",
-    "diagonal_multivariate_normal",
+    "factorized_multivariate_normal",
     "block_diagonal_multivariate_normal",
     "multivariate_normal",
 ]
@@ -92,7 +92,7 @@ def _train_model_svi(
     ## get parameters
     pyro.clear_param_store()  # to forget old guide shapes
     params_model = list(model.parameters())
-    guide(x=x, y=y)
+    guide(x=x, y=y)  # "create guide"
     params_guide = list(guide.parameters())
     params = params_model + params_guide
 
@@ -108,6 +108,7 @@ def _train_model_svi(
         lr_scheduler = None
 
     ## loss
+    # regularizer_fn = None
     regularizer_fn = _compute_kl_regularizer
     loss_fn = Trace_ELBO().differentiable_loss
 
@@ -124,6 +125,8 @@ def _train_model_svi(
         if regularizer_fn is not None:
             regularizer = regularizer_fn(model=model)
             loss = loss + alpha_reg * regularizer
+        else:
+            regularizer = torch.tensor(0.0)
 
         # compute gradients and step
         loss.backward()
@@ -382,7 +385,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
 
             return prior_wb
 
-        if type == "diagonal_multivariate_normal":
+        if type == "factorized_multivariate_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
@@ -410,23 +413,12 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 init_value=torch.eye(self._bnn.size_b),
                 constraint=constraints.lower_cholesky,
             )
-            # self.prior_wb_scale_tril = PyroParam(
-            #     init_value=lambda: torch.block_diag(
-            #         self.prior_w_scale_tril,
-            #         self.prior_b_scale_tril,
-            #     )
-            # )
-            # vs. 
-            # self.prior_wb_scale_tril = torch.block_diag(
-            #     self.prior_w_scale_tril, self.prior_b_scale_tril
-            # )
-            # vs. 
-            # dist.MultivariateNormal(..., scale_tril=torch.block_diag...)
-            # vs.
-            # dist.MultivariateNormal(..., scale_tril=torch.diag...)
-            # vs. old code -> cf. results
             prior_wb = lambda self: dist.MultivariateNormal(
-                self.prior_wb_loc, scale_tril=self.prior_wb_scale_tril
+                loc=self.prior_wb_loc,
+                scale_tril=torch.block_diag(
+                    self.prior_w_scale_tril,
+                    self.prior_b_scale_tril,
+                ),
             )
             return prior_wb
 
@@ -440,7 +432,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 constraint=constraints.lower_cholesky,
             )
             prior_wb = lambda self: dist.MultivariateNormal(
-                self.prior_wb_loc, scale_tril=self.prior_wb_scale_tril
+                loc=self.prior_wb_loc,
+                scale_tril=self.prior_wb_scale_tril,
             )
             return prior_wb
 

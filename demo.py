@@ -22,7 +22,7 @@ def main():
     ## flags, constants
     pyro.set_rng_seed(123)
     plot = True
-    smoke_test = False
+    smoke_test = True
     # benchmarks
     bm = Quadratic1D
     noise_stddev = 0.01
@@ -34,10 +34,10 @@ def main():
     n_hidden = 1
     d_hidden = 8
     infer_noise_stddev = True
-    prior_type = "multivariate_normal"
+    prior_type = "block_diagonal_multivariate_normal"
     # training
     do_meta_training = True
-    n_epochs = 5000 if not smoke_test else 100
+    n_epochs = 5000 if not smoke_test else 250
     initial_lr = 0.1
     final_lr = 0.00001
     alpha_reg = 0.0
