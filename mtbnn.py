@@ -18,6 +18,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam as AdamTorch
 from torch.optim.lr_scheduler import ExponentialLR
 
+import wandb
+
 _allowed_prior_types = [
     "isotropic_normal",
     "factorized_normal",
@@ -87,8 +89,13 @@ def _train_model_svi(
     n_epochs: int,
     alpha_reg: float,
     initial_lr: float,
+    wandb_run,
+    log_identifier: str,
     final_lr: Optional[float] = None,
 ) -> torch.tensor:
+    # watch model exectuion with wandb
+    wandb_run.watch(model, log="all")
+
     ## get parameters
     pyro.clear_param_store()  # to forget old guide shapes
     params_model = list(model.parameters())
@@ -108,7 +115,6 @@ def _train_model_svi(
         lr_scheduler = None
 
     ## loss
-    # regularizer_fn = None
     regularizer_fn = _compute_kl_regularizer
     loss_fn = Trace_ELBO().differentiable_loss
 
@@ -139,6 +145,16 @@ def _train_model_svi(
 
         # logging
         train_losses.append(loss.item())
+        # TODO: find neater way to log parametric learning curve
+        n_context = x.shape[-2]
+        wandb_run.log(
+            {
+                f"{log_identifier}/epoch": i,
+                f"{log_identifier}/loss_n_context_{n_context:03d}": loss,
+                f"{log_identifier}/elbo_n_context_{n_context:03d}": elbo,
+                f"{log_identifier}/regularizer_n_context_{n_context:03d}": regularizer,
+            }
+        )
         if i % 100 == 0 or i == len(range(n_epochs)) - 1:
             print(f"[iter {i:04d}] elbo = {elbo:.4e} | reg = {regularizer:.4e}")
 
@@ -325,6 +341,9 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
     ):
         super().__init__()
 
+        ## clear everything
+        pyro.clear_param_store()  # TODO: this should not be necessary if we properly spawn a process for each wandb run?
+
         ## the mean network
         self._bnn = _create_batched_bnn(
             d_x=d_x,
@@ -352,7 +371,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self.eval()
 
     def _create_bnn_priors(self, type) -> dist.Distribution:
-        assert type in _allowed_prior_types
+        assert type in _allowed_prior_types, f"Unknown prior type '{type}'!"
 
         if type == "isotropic_normal":
             self.prior_wb_loc = PyroParam(
@@ -500,6 +519,14 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
 
         return guide
 
+    def export_onnx(self, f) -> None:
+        raise NotImplementedError  # not all ops we need are supported by onnx yet
+        torch.onnx.export(
+            model=self,
+            args=(torch.randn((2, 3, 4)), torch.randn((2, 3, 4))),
+            f=f,
+        )
+
     def meta_train(
         self,
         x: np.ndarray,
@@ -508,6 +535,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         initial_lr: float,
         final_lr: float,
         alpha_reg: float,
+        wandb_run,
     ) -> np.ndarray:
         self.unfreeze_prior()
         self.train()
@@ -522,6 +550,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             initial_lr=initial_lr,
             final_lr=final_lr,
             alpha_reg=alpha_reg,
+            wandb_run=wandb_run,
+            log_identifier="meta_train",
         )
 
         self._meta_guide = meta_guide
@@ -537,10 +567,12 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         n_epochs: int,
         initial_lr: float,
         final_lr: float,
+        wandb_run,
     ) -> np.ndarray:
         self.train()
 
-        if x.size == 0:
+        n_context = x.shape[-2]
+        if n_context == 0:
             guide = None
             epoch_losses = np.array([])
         else:
@@ -554,6 +586,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 initial_lr=initial_lr,
                 final_lr=final_lr,
                 alpha_reg=0.0,
+                wandb_run=wandb_run,
+                log_identifier=f"adapt",
             ).numpy()
 
         self._guide = guide

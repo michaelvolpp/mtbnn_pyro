@@ -260,6 +260,8 @@ def plot_predictions(
         )
     fig.tight_layout()
 
+    return fig
+
 
 def plot_distributions(
     site_name,
@@ -336,6 +338,8 @@ def plot_distributions(
         ax.set_xlabel(site_name)
     fig.tight_layout()
 
+    return fig
+
 
 def plot_metrics(
     learning_curve_meta, learning_curves_test, lls, lls_context, n_contexts
@@ -381,3 +385,5 @@ def plot_metrics(
     ax.grid()
 
     fig.tight_layout()
+    
+    return fig
