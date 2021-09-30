@@ -1,0 +1,19 @@
+name: network_size
+description: |
+  Sweep network sizes and n_tasks_meta for Sinusoid1D.
+  Compare factorized and full-covariance prior_types.
+  Evaluate on 3 random seeds.
+project: mtbnn_v0
+program: demo.py
+method: grid
+parameters: 
+    bm: 
+      value: "Sinusoid1D"
+    seed_pyro: 
+      values: [123, 223, 323]
+    prior_type:
+      values: ["factorized_multivariate_normal", "multivariate_normal"]
+    d_hidden:
+      values: [8, 16, 32]
+    n_tasks_meta:
+      values: [8, 16, 32]

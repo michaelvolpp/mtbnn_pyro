@@ -1,7 +1,7 @@
 """
 Plotting functions for (multi-task) Bayesian neural networks.
 """
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import seaborn as sns
@@ -136,10 +136,11 @@ def plot_predictions(
     pred_summary_prior_meta_trained,
     pred_summary_posterior_meta,
     pred_summaries_posterior_test,
-    max_tasks=3,
+    n_contexts_plot,
+    max_tasks,
 ):
     fig, axes = plt.subplots(
-        nrows=2, ncols=3 + len(n_contexts_test), figsize=(16, 8), sharey=True
+        nrows=2, ncols=3 + len(n_contexts_plot), figsize=(16, 8), sharey=True
     )
     fig.suptitle(f"Prior and Posterior Predictions")
 
@@ -185,8 +186,13 @@ def plot_predictions(
         max_tasks=max_tasks,
     )
 
+    plt_ct = -1
     for i, n_context in enumerate(n_contexts_test):
-        ax = axes[0, 3 + i]
+        if n_context not in n_contexts_plot:
+            continue
+
+        plt_ct += 1
+        ax = axes[0, 3 + plt_ct]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_title(f"Posterior Mean\n(test data, n_ctx={n_context:d})")
@@ -243,8 +249,13 @@ def plot_predictions(
         max_tasks=max_tasks,
     )
 
+    plt_ct = -1
     for i, n_context in enumerate(n_contexts_test):
-        ax = axes[1, 3 + i]
+        if n_context not in n_contexts_plot:
+            continue
+
+        plt_ct += 1
+        ax = axes[1, 3 + plt_ct]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_title(f"Posterior Observation\n(test data, n_ctx={n_context:d})")
@@ -265,6 +276,7 @@ def plot_predictions(
 
 def plot_distributions(
     site_name,
+    site_idx,
     bm_meta_params,
     bm_test_params,
     samples_prior_meta_untrained,
@@ -272,16 +284,19 @@ def plot_distributions(
     samples_posterior_meta,
     samples_posteriors_test,
     n_contexts_test,
-    max_tasks=3,
+    max_tasks,
+    n_contexts_plot,
 ):
     fig, axes = plt.subplots(
         nrows=1,
-        ncols=3 + len(n_contexts_test),
+        ncols=3 + len(n_contexts_plot),
         figsize=(16, 8),
         sharex=True,
         squeeze=False,
     )
-    fig.suptitle(f"Prior and Posterior Distributions of site '{site_name}'")
+    fig.suptitle(
+        f"Prior and Posterior Distributions of site '{site_name}[...,{site_idx:d}]'"
+    )
 
     n_meta_tasks = samples_prior_meta_untrained[site_name].shape[1]
     n_test_tasks = samples_posteriors_test[0][site_name].shape[1]
@@ -292,7 +307,7 @@ def plot_distributions(
         ax = axes[0, 0]
         ax.set_title("Prior distribution\n(untrained)")
         sns.distplot(
-            samples_prior_meta_untrained[site_name].squeeze()[:, l],
+            samples_prior_meta_untrained[site_name].squeeze()[:, l, site_idx],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -302,7 +317,7 @@ def plot_distributions(
         ax = axes[0, 1]
         ax.set_title("Prior distribution\n(trained on meta data)")
         sns.distplot(
-            samples_prior_meta_trained[site_name].squeeze()[:, l],
+            samples_prior_meta_trained[site_name].squeeze()[:, l, site_idx],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
@@ -312,21 +327,26 @@ def plot_distributions(
         ax = axes[0, 2]
         ax.set_title("Posterior distribution\n(meta data)")
         sns.distplot(
-            samples_posterior_meta[site_name].squeeze()[:, l],
+            samples_posterior_meta[site_name].squeeze()[:, l, site_idx],
             kde_kws={"label": f"Task {l}"},
             ax=ax,
         )
         if bm_meta_params is not None:
             ax.axvline(x=bm_meta_params[l], color=sns.color_palette()[l])
 
+    plt_ct = -1
     for i, n_context in enumerate(n_contexts_test):
+        if n_context not in n_contexts_plot:
+            continue
+
+        plt_ct += 1
         for l in range(n_test_tasks):
             if l == max_tasks:
                 break
-            ax = axes[0, 3 + i]
+            ax = axes[0, 3 + plt_ct]
             ax.set_title(f"Posterior distribution\n(test data, n_ctx={n_context:d})")
             sns.distplot(
-                samples_posteriors_test[i][site_name].squeeze()[:, l],
+                samples_posteriors_test[i][site_name].squeeze()[:, l, site_idx],
                 kde_kws={"label": f"Test Task {l}"},
                 ax=ax,
             )
@@ -344,7 +364,7 @@ def plot_distributions(
 def plot_metrics(
     learning_curve_meta, learning_curves_test, lls, lls_context, n_contexts
 ):
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(16,8), squeeze=False)
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(16, 8), squeeze=False)
     fig.suptitle("Metrics")
 
     ax = axes[0, 0]
@@ -385,5 +405,5 @@ def plot_metrics(
     ax.grid()
 
     fig.tight_layout()
-    
+
     return fig

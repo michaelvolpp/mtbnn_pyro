@@ -632,13 +632,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             num_samples=n_samples,
             parallel=True,  # our model is vectorized
             return_sites=(
-                # if model is linear, those sites are available
-                "net.0.weight",
-                "net.0.bias",
-                # those sites are always available
                 "obs",
-                "sigma",
                 "_RETURN",
+                "_wb",
+                "_noise_stddev",
             ),
         )
         samples = predictive(x=torch.tensor(x, dtype=torch.float), y=None)

@@ -1,0 +1,20 @@
+name: prior_types2
+description: |
+  Sweep prior types for Affine1D, Quadratic1D, Sinusoid1D.
+  Evaluate on 3 random seeds.
+project: mtbnn_v0
+program: demo.py
+method: grid
+parameters: 
+    bm: 
+      values: ["Affine1D", "Quadratic1D", "Sinusoid1D"]
+    seed_pyro: 
+      values: [123, 223, 323]
+    prior_type: 
+      values: 
+        - "fixed"
+        - "isotropic_normal"
+        - "factorized_normal"
+        - "factorized_multivariate_normal"
+        - "block_diagonal_multivariate_normal"
+        - "multivariate_normal"
