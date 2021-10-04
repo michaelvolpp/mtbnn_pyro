@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: mtbnn
-Version: 0.0.0
+Version: 0.0.1
 Summary: An implementation of multi-task Bayesian neural networks.
 Home-page: UNKNOWN
 Author: Michael Volpp

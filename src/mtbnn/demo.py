@@ -8,10 +8,10 @@ import warnings
 
 import numpy as np
 import pyro
+import wandb
 from matplotlib import pyplot as plt
 from metalearning_benchmarks import Affine1D, Quadratic1D, Sinusoid
 
-import wandb
 from mtbnn import MultiTaskBayesianNeuralNetwork
 from plotting import plot_distributions, plot_metrics, plot_predictions
 from util import collate_data, norm_area_under_curve
@@ -288,7 +288,7 @@ def run_experiment(
 def main():
     ## config
     wandb_mode = os.getenv("WANDB_MODE", "online")
-    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
+    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(

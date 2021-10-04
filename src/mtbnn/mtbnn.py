@@ -18,8 +18,6 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam as AdamTorch
 from torch.optim.lr_scheduler import ExponentialLR
 
-import wandb
-
 _allowed_prior_types = [
     "isotropic_normal",
     "factorized_normal",
