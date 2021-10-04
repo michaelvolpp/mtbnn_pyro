@@ -4,6 +4,7 @@ Utility functions for (multi-task) Bayesian neural networks.
 from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchmark
 import numpy as np
 import pyro
+from scipy import integrate
 
 
 def collate_data(bm: MetaLearningBenchmark):
@@ -57,3 +58,25 @@ def print_headline_string(string):
     print(starline)
     print(string)
     print(starline)
+
+
+def norm_area_under_curve(x, y):
+    """
+    Computes the area under the curve f(x) = y using the trapeziodal rule,
+    normalized by the length of the domain.
+    """
+    assert len(np.unique(x)) == len(x), "x contains duplicate values!"
+    domain_length = max(x) - min(x)
+    if domain_length == 0.0:
+        return None
+
+    area = integrate.trapezoid(x=x, y=y)
+    normalized_area = area / domain_length
+
+    return normalized_area
+
+
+if __name__ == "__main__":
+    x = [1.0, 2.0]
+    y = [-100.0, 100.1]
+    print(norm_area_under_curve(x=x, y=y))

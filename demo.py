@@ -14,7 +14,7 @@ from metalearning_benchmarks import Affine1D, Quadratic1D, Sinusoid
 import wandb
 from mtbnn import MultiTaskBayesianNeuralNetwork
 from plotting import plot_distributions, plot_metrics, plot_predictions
-from util import collate_data
+from util import collate_data, norm_area_under_curve
 from util import print_headline_string as prinths
 from util import print_pyro_parameters, split_tasks, summarize_samples
 
@@ -183,13 +183,19 @@ def run_experiment(
         )
         pred_summaries_posteriors_test.append(cur_pred_summary_posterior_test)
         samples_posteriors_test.append(cur_samples_posterior_test)
-        wandb.log(
+        wandb_run.log(
             {
                 "eval/n_context": n_context,
                 "eval/marg_ll_target": lls[i],
                 "eval/marg_ll_context": lls_context[i],
             }
         )
+    wandb_run.summary["eval/marg_ll_target_mean"] = norm_area_under_curve(
+        x=config["n_contexts_pred"], y=lls
+    )
+    wandb_run.summary["eval/marg_ll_context_mean"] = norm_area_under_curve(
+        x=config["n_contexts_pred"], y=lls_context
+    )
 
     prinths("Freezed Pyro Parameters (after adaptation)")
     print_pyro_parameters()
@@ -282,7 +288,7 @@ def run_experiment(
 def main():
     ## config
     wandb_mode = os.getenv("WANDB_MODE", "online")
-    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
+    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(
