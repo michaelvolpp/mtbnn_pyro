@@ -281,7 +281,7 @@ def run_experiment(
                 # wandb_run.log({"latent_distribution_b_plotly": fig})
                 wandb_run.log({"latent_distribution_b_png": wandb.Image(fig)})
 
-        if wandb_run.mode == "disabled"
+        if wandb_run.mode == "disabled":
             plt.show()
 
 
