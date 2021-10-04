@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+setup.py
+src/mtbnn/__init__.py
+src/mtbnn/demo.py
+src/mtbnn/gmm.py
+src/mtbnn/mtbnn.py
+src/mtbnn/plotting.py
+src/mtbnn/util.py
+src/mtbnn.egg-info/PKG-INFO
+src/mtbnn.egg-info/SOURCES.txt
+src/mtbnn.egg-info/dependency_links.txt
+src/mtbnn.egg-info/requires.txt
+src/mtbnn.egg-info/top_level.txt

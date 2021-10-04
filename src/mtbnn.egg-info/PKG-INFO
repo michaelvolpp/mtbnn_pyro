@@ -1,0 +1,17 @@
+Metadata-Version: 2.1
+Name: mtbnn
+Version: 0.0.0
+Summary: An implementation of multi-task Bayesian neural networks.
+Home-page: UNKNOWN
+Author: Michael Volpp
+License: tbd
+Platform: linux
+Platform: osx
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.9
+Requires-Python: >=3.9
+License-File: LICENSE
+
+UNKNOWN
+

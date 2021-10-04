@@ -2,3 +2,4 @@
 __pycache__/
 log/
 wandb/
+mtbnn.code-workspace
