@@ -10,15 +10,12 @@ import numpy as np
 import pyro
 import wandb
 from matplotlib import pyplot as plt
-from metalearning_benchmarks import Affine1D, Quadratic1D, Sinusoid
-
-from mtbnn import MultiTaskBayesianNeuralNetwork
-from plotting import plot_distributions, plot_metrics, plot_predictions
-from util import collate_data, norm_area_under_curve
-from util import print_headline_string as prinths
-from util import print_pyro_parameters, split_tasks, summarize_samples
-
-BM_DICT = {"Affine1D": Affine1D, "Quadratic1D": Quadratic1D, "Sinusoid1D": Sinusoid}
+from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork
+from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
+from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
+from mtutils.mtutils import print_headline_string as prinths
+from mtutils.mtutils import (print_pyro_parameters, split_tasks,
+                             summarize_samples)
 
 
 def run_experiment(
@@ -231,7 +228,7 @@ def run_experiment(
             # plot prior and posterior distributions
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                if isinstance(bm_meta, Affine1D):
+                if isinstance(bm_meta, BM_DICT["Affine1D"]):
                     bm_meta_params = np.zeros(config["n_tasks_meta"])
                     bm_test_params = np.zeros(config["n_tasks_test"])
                     for l, task in enumerate(bm_meta):
@@ -256,7 +253,7 @@ def run_experiment(
                 # wandb_run.log({"latent_distribution_w_plotly": fig})
                 wandb_run.log({"latent_distribution_w_png": wandb.Image(fig)})
 
-                if isinstance(bm_meta, Affine1D):
+                if isinstance(bm_meta, BM_DICT["Affine1D"]):
                     bm_meta_params = np.zeros(config["n_tasks_meta"])
                     bm_test_params = np.zeros(config["n_tasks_test"])
                     for l, task in enumerate(bm_meta):
@@ -287,14 +284,15 @@ def run_experiment(
 
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "online")
+    wandb_mode = os.getenv("WANDB_MODE", "enabled")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(
+        model="MTBNN",
         seed_pyro=123,
         # benchmarks
-        bm="Affine1D",
+        bm="Sinusoid1D",
         noise_stddev=0.01,
         n_tasks_meta=8,
         n_points_per_task_meta=16,

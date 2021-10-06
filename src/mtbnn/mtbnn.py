@@ -7,6 +7,7 @@ from typing import List, Optional, Union
 import numpy as np
 import pyro
 import torch
+from mtutils.mtutils import BatchedLinear, BatchedSequential, broadcast_xwb
 from pyro import distributions as dist
 from pyro.distributions import constraints
 from pyro.infer import Predictive, Trace_ELBO
@@ -113,8 +114,8 @@ def _train_model_svi(
         lr_scheduler = None
 
     ## loss
-    regularizer_fn = _compute_kl_regularizer
     loss_fn = Trace_ELBO().differentiable_loss
+    regularizer_fn = _compute_kl_regularizer
 
     ## training loop
     train_losses = []
@@ -197,130 +198,6 @@ def _marginal_log_likelihood(
     log_prob = log_prob / n_task / n_pts
 
     return log_prob
-
-
-def _broadcast_xwb(
-    x: torch.tensor,
-    w: torch.tensor,
-    b: torch.tensor,
-) -> Union[torch.tensor, torch.tensor, torch.tensor]:
-    ## check inputs
-    assert x.ndim == 3
-    n_tasks = x.shape[0]
-    n_points = x.shape[1]
-    assert w.ndim == 3 or w.ndim == 4
-    has_sample_dim = w.ndim == 4
-    assert w.ndim == b.ndim
-    assert w.shape[-2] == b.shape[-2] == 1  # singleton pts-dim present due to plates
-    n_samples = w.shape[0] if has_sample_dim else 1
-
-    if has_sample_dim:
-        ## add sample dim
-        x = x[None, ...]
-
-        ## broadcast
-        x = x.expand([n_samples, n_tasks, n_points, -1])
-        w = w.expand([n_samples, n_tasks, n_points, -1])
-        b = b.expand([n_samples, n_tasks, n_points, -1])
-    else:
-        ## broadcast
-        x = x.expand([n_tasks, n_points, -1])
-        w = w.expand([n_tasks, n_points, -1])
-        b = b.expand([n_tasks, n_points, -1])
-
-    return x, w, b
-
-
-class BatchedSequential(nn.Sequential):
-    """
-    A container akin to nn.Sequential supporting BatchedLinear layers.
-    """
-
-    def __init__(
-        self,
-        *args,
-    ):
-        super().__init__(*args)
-
-    @property
-    def size_w(self):
-        size = 0
-        for module in self:
-            if isinstance(module, BatchedLinear):
-                size += module.size_w
-        return size
-
-    @property
-    def size_b(self):
-        size = 0
-        for module in self:
-            if isinstance(module, BatchedLinear):
-                size += module.size_b
-        return size
-
-    def forward(
-        self, x: torch.tensor, w: torch.tensor, b: torch.tensor
-    ) -> torch.tensor:
-        w_pos, b_pos = 0, 0
-        for module in self:
-            if isinstance(module, BatchedLinear):
-                x = module(
-                    x=x,
-                    w=w[..., w_pos : w_pos + module.size_w],
-                    b=b[..., b_pos : b_pos + module.size_b] if b is not None else None,
-                )
-                w_pos += module.size_w
-                b_pos += module.size_b
-            else:
-                x = module(x)
-
-        assert w_pos == self.size_w
-        if b is not None:
-            assert b_pos == self.size_b
-
-        return x
-
-
-class BatchedLinear(nn.Module):
-    """
-    A linear layer with batched weights and bias.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-    ):
-        super().__init__()
-
-        self.in_features = in_features
-        self.out_features = out_features
-        self.size_w = self.in_features * self.out_features
-        self.size_b = self.out_features
-
-    def forward(
-        self,
-        x: torch.tensor,
-        w: torch.tensor,
-        b: Optional[torch.tensor] = None,
-    ) -> torch.tensor:
-        ## reshape weight vector to a weight matrix
-        w = w.reshape(tuple(w.shape[:-1]) + (self.out_features, self.in_features))
-
-        ## check dimensions
-        assert x.ndim == w.ndim - 1
-        assert x.shape[:-1] == w.shape[:-2]  # same batch dimensions
-        if b is not None:
-            assert x.ndim == b.ndim
-            assert x.shape[:-1] == b.shape[:-1]  # same batch dimensions
-            assert b.shape[-1] == w.shape[-2]  # b and w are compatible
-
-        ## compute the output
-        h = torch.einsum("...hx,...x->...h", w, x)
-        if b is not None:
-            h = h + b
-
-        return h
 
 
 class MultiTaskBayesianNeuralNetwork(PyroModule):
@@ -493,7 +370,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             w = wb[..., : self._bnn.size_w]
             b = wb[..., self._bnn.size_w :]
             # add samples- and tasks-dim
-            x, w, b = _broadcast_xwb(x=x, w=w, b=b)
+            x, w, b = broadcast_xwb(x=x, w=w, b=b)
             mean = self._bnn(x=x, w=w, b=b)
 
             if noise_stddev.nelement() > 1:
@@ -574,6 +451,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             guide = None
             epoch_losses = np.array([])
         else:
+            # TODO: do we have to clear the param store before intializing new guide?
             guide = AutoDiagonalNormal(model=self)
             epoch_losses = _train_model_svi(
                 model=self,

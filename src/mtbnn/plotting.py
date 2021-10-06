@@ -6,8 +6,7 @@ from typing import List, Optional
 import numpy as np
 import seaborn as sns
 from matplotlib import pyplot as plt
-
-from util import split_tasks
+from mtutils.mtutils import split_tasks
 
 
 def plot_predictions_for_one_set_of_tasks(
