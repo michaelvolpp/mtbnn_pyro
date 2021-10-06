@@ -1,0 +1,19 @@
+name: network_size_sinusoid1d_single_task_mtmlp
+description: |
+  Sweep network sizes for Sinusoid1D for single-task case with vanilla MTMLP model.
+  Determine influence of normalization.
+  Evaluate on 3 random seeds.
+project: mtbnn_v0
+program: run_mtmlp.py
+method: grid
+parameters: 
+    bm: 
+      value: "Sinusoid1D"
+    seed_pyro: 
+      values: [123, 223, 323]
+    d_hidden:
+      values: [2, 4, 8, 16, 32]
+    n_hidden:
+      values: [1, 2]
+    normalize_bm:
+      values: [True, False]
