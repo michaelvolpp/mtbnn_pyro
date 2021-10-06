@@ -1,7 +1,7 @@
 name: network_size_sinusoid1d_single_task
 description: |
   Sweep network sizes and n_tasks_meta for Sinusoid1D for single-task case.
-  Evaluate on 2 random seeds.
+  Evaluate on 3 random seeds.
 project: mtbnn_v0
 program: demo.py
 method: grid
@@ -9,10 +9,8 @@ parameters:
     bm: 
       value: "Sinusoid1D"
     seed_pyro: 
-      values: [123, 223]
+      values: [123, 223, 323]
     prior_type:
       values: ["fixed"]
     d_hidden:
-      values: [8, 16, 32, 64, 128]
-    n_tasks_meta:
-      values: [8, 16, 32, 64, 128]
+      values: [4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128]
