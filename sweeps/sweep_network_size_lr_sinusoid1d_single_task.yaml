@@ -1,0 +1,25 @@
+name: network_size_lr_sinusoid1d_single_task
+description: |
+  Sweep network sizes and lr for Sinusoid1D for single-task case.
+project: mtbnn_v0
+program: demo.py
+method: random 
+parameters: 
+    bm: 
+      value: "Sinusoid1D"
+    seed_pyro: 
+      value: 123
+    prior_type:
+      value: "fixed"
+    d_hidden:
+      distribution: int_uniform
+      min: 4
+      max: 128
+    initial_lr:
+      distribution: log_uniform
+      min: -4.6
+      max: 0.0
+    final_lr:
+      distribution: log_uniform
+      min: -13.8
+      max: -4.6
