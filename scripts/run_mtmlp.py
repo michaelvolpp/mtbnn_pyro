@@ -122,7 +122,7 @@ def run_experiment(
 def main():
     ## config
     wandb_mode = os.getenv("WANDB_MODE", "disabled")
-    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
+    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(

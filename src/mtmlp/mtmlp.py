@@ -28,7 +28,7 @@ def _create_mtmlp(
             BatchedLinear(
                 in_features=d_x,
                 out_features=d_y,
-                manual_wb=False,
+                external_wb=False,
                 n_task=n_task,
             )
         )
@@ -37,7 +37,7 @@ def _create_mtmlp(
             BatchedLinear(
                 in_features=d_x,
                 out_features=d_hidden,
-                manual_wb=False,
+                external_wb=False,
                 n_task=n_task,
             )
         )
@@ -47,7 +47,7 @@ def _create_mtmlp(
                 BatchedLinear(
                     in_features=d_hidden,
                     out_features=d_hidden,
-                    manual_wb=False,
+                    external_wb=False,
                     n_task=n_task,
                 )
             )
@@ -56,7 +56,7 @@ def _create_mtmlp(
             BatchedLinear(
                 in_features=d_hidden,
                 out_features=d_y,
-                manual_wb=False,
+                external_wb=False,
                 n_task=n_task,
             )
         )

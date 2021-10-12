@@ -81,14 +81,14 @@ class BatchedLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        manual_wb: bool = True,
+        external_wb: bool = True,
         n_task: Optional[int] = None,
     ):
         """
-        If manual_wb == False, the layer will manage its weights and biases
+        If external_wb == False, the layer will manage its weights and biases
         automatically. I.p. it will take care of state-of-the-art initialization.
         Then, wb_batch_size has to be provided.
-        If manual_wb == True, the weights and biases have to be provided in each
+        If external_wb == True, the weights and biases have to be provided in each
         forward pass.
         """
         super().__init__()
@@ -97,10 +97,10 @@ class BatchedLinear(nn.Module):
         self.out_features = out_features
         self.size_w = self.in_features * self.out_features
         self.size_b = self.out_features
-        self.manual_wb = manual_wb
+        self.external_wb = external_wb
         self.n_task = n_task
 
-        if not self.manual_wb:
+        if not self.external_wb:
             init_w, init_b = self._get_init_wb()
             self._w = torch.nn.Parameter(init_w, requires_grad=True)
             self._b = torch.nn.Parameter(init_b, requires_grad=True)
@@ -131,7 +131,7 @@ class BatchedLinear(nn.Module):
          w = (n_task, 1, d_w) 
          b = (n_task, 1, d_b) 
         """
-        if not self.manual_wb:
+        if not self.external_wb:
             assert (w is None) and (b is None)
             x, w, b = broadcast_xwb(x=x, w=self._w, b=self._b)
 

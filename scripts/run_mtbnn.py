@@ -4,18 +4,19 @@ implementation.
 """
 
 import os
+from sys import int_info
 import warnings
 
 import numpy as np
 import pyro
 import wandb
 from matplotlib import pyplot as plt
+from wandb.sdk.wandb_init import init
 from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork
 from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
 from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
 from mtutils.mtutils import print_headline_string as prinths
-from mtutils.mtutils import (print_pyro_parameters, split_tasks,
-                             summarize_samples)
+from mtutils.mtutils import print_pyro_parameters, split_tasks, summarize_samples
 
 
 def run_experiment(
@@ -87,7 +88,7 @@ def run_experiment(
 
     ## obtain predictions on meta data before meta training
     samples_prior_meta_untrained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide="prior"
+        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
     )
     pred_summary_prior_meta_untrained = summarize_samples(
         samples=samples_prior_meta_untrained
@@ -100,7 +101,7 @@ def run_experiment(
     ## meta training
     prinths("Performing Meta Training...")
     if do_meta_training:
-        learning_curve_meta = mtbnn.meta_train(
+        learning_curve_meta, guide_meta = mtbnn.meta_train(
             x=x_meta,
             y=y_meta,
             n_epochs=config["n_epochs"],
@@ -111,7 +112,7 @@ def run_experiment(
         )
     else:
         print("No meta training performed!")
-        learning_curve_meta = None
+        learning_curve_meta, guide_meta = None, None
 
     ## save model
     # with open("model.onnx", "wb") as f:
@@ -125,14 +126,14 @@ def run_experiment(
     ## obtain predictions on meta data after training
     # obtain prior predictions
     samples_prior_meta_trained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide="prior"
+        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
     )
     pred_summary_prior_meta_trained = summarize_samples(
         samples=samples_prior_meta_trained
     )
     # obtain posterior predictions
     samples_posterior_meta = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide="meta"
+        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=guide_meta
     )
     pred_summary_posterior_meta = summarize_samples(samples=samples_posterior_meta)
 
@@ -150,30 +151,31 @@ def run_experiment(
         x_context, y_context, x_target, y_target = split_tasks(
             x=x_test, y=y_test, n_context=n_context
         )
-        learning_curves_test.append(
-            mtbnn.adapt(
-                x=x_context,
-                y=y_context,
-                n_epochs=config["n_epochs"],
-                initial_lr=config["initial_lr"],
-                final_lr=config["final_lr"],
-                wandb_run=wandb_run,
-            )
+        lc, guide_test = mtbnn.adapt(
+            x=x_context,
+            y=y_context,
+            n_epochs=config["n_epochs"],
+            initial_lr=config["initial_lr"],
+            final_lr=config["final_lr"],
+            wandb_run=wandb_run,
         )
+        learning_curves_test.append(lc)
         lls[i] = mtbnn.marginal_log_likelihood(
             x=x_target,
             y=y_target,
             n_samples=config["n_samples_pred"],
-            guide_choice="test",
+            guide=guide_test,
         )
         lls_context[i] = mtbnn.marginal_log_likelihood(
             x=x_context,
             y=y_context,
             n_samples=config["n_samples_pred"],
-            guide_choice="test",
+            guide=guide_test,
         )
         cur_samples_posterior_test = mtbnn.predict(
-            x=x_pred_test, n_samples=config["n_samples_pred"], guide="test"
+            x=x_pred_test,
+            n_samples=config["n_samples_pred"],
+            guide=guide_test,
         )
         cur_pred_summary_posterior_test = summarize_samples(
             samples=cur_samples_posterior_test
@@ -281,10 +283,9 @@ def run_experiment(
         if wandb_run.mode == "disabled":
             plt.show()
 
-
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "online")
+    wandb_mode = os.getenv("WANDB_MODE", "disabled")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
@@ -292,7 +293,7 @@ def main():
         model="MTBNN",
         seed_pyro=123,
         # benchmarks
-        bm="Sinusoid1D",
+        bm="Affine1D",
         noise_stddev=0.01,
         n_tasks_meta=8,
         n_points_per_task_meta=16,
@@ -304,7 +305,7 @@ def main():
         n_hidden=1,
         d_hidden=8,
         infer_noise_stddev=True,
-        prior_type="fixed",
+        prior_type="factorized_normal",
         # training
         n_epochs=5000 if not smoke_test else 100,
         initial_lr=0.1,
@@ -314,14 +315,15 @@ def main():
         n_samples_pred=1000 if not smoke_test else 100,
         # evaluation
         n_contexts_pred=(
-            [0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 128]
+            # [0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 128]
+            [0,  5, 10, 20, 50, 128]
             if not smoke_test
-            else [0, 5, 16]
+            else [0, 5, 10, 50, 128]
         ),
         # plot
         plot=True,
         max_tasks_plot=4,
-        n_contexts_plot=[5, 10, 50],
+        n_contexts_plot=[0, 5, 10, 50],
     )
 
     if wandb_mode != "disabled":

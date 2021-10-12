@@ -7,11 +7,16 @@ from typing import List, Optional, Union
 import numpy as np
 import pyro
 import torch
-from mtutils.mtutils import BatchedLinear, BatchedSequential, broadcast_xwb
+from mtutils.mtutils import (
+    BatchedLinear,
+    BatchedSequential,
+    broadcast_xwb,
+    print_pyro_parameters,
+)
 from pyro import distributions as dist
 from pyro.distributions import constraints
 from pyro.infer import Predictive, Trace_ELBO
-from pyro.infer.autoguide import AutoDiagonalNormal
+from pyro.infer.autoguide import AutoDiagonalNormal, AutoNormal
 from pyro.nn import PyroModule, PyroParam, PyroSample
 from torch import nn
 from torch.distributions.kl import kl_divergence
@@ -96,7 +101,6 @@ def _train_model_svi(
     wandb_run.watch(model, log="all")
 
     ## get parameters
-    pyro.clear_param_store()  # to forget old guide shapes
     params_model = list(model.parameters())
     guide(x=x, y=y)  # "create guide"
     params_guide = list(guide.parameters())
@@ -217,7 +221,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         super().__init__()
 
         ## clear everything
-        pyro.clear_param_store()  # TODO: this should not be necessary if we properly spawn a process for each wandb run?
+        # TODO: this should not be necessary if we properly spawn a process for each wandb run?
+        pyro.clear_param_store()
 
         ## the mean network
         self._bnn = _create_batched_bnn(
@@ -228,27 +233,25 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         )
 
         ## latent variables
-        self._prior_wb = self._create_bnn_priors(prior_type)
+        self._prior_type = prior_type
+        self._prior_wb = self._create_bnn_priors()
         self._wb = PyroSample(self._prior_wb)
-        # TODO: learn noise prior?
-        if noise_stddev is None:
+        self._infer_noise_stddev = noise_stddev is None
+        if self._infer_noise_stddev:
+            # TODO: learn noise prior?
             self._prior_noise_stddev = dist.Uniform(0.0, 1.0)
             self._noise_stddev = PyroSample(self._prior_noise_stddev)
         else:
             self._noise_stddev = noise_stddev
 
-        ## the guides
-        self._meta_guide = None
-        self._guide = None
-
         ## set evaluation mode
         self.freeze_prior()
         self.eval()
 
-    def _create_bnn_priors(self, type) -> dist.Distribution:
-        assert type in _allowed_prior_types, f"Unknown prior type '{type}'!"
+    def _create_bnn_priors(self) -> dist.Distribution:
+        assert self._prior_type in _allowed_prior_types, f"Unknown prior type '{type}'!"
 
-        if type == "isotropic_normal":
+        if self._prior_type == "isotropic_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.tensor(0.0),
                 constraint=constraints.real,
@@ -264,13 +267,13 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             )
             return prior_wb
 
-        if type == "factorized_normal":
+        if self._prior_type == "factorized_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
             )
             self.prior_wb_scale = PyroParam(
-                init_value=torch.ones(self._bnn.size_w + self._bnn.size_b),
+                init_value=0.1 * torch.ones(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.positive,
             )
             prior_wb = lambda self: dist.Normal(
@@ -279,7 +282,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
 
             return prior_wb
 
-        if type == "factorized_multivariate_normal":
+        if self._prior_type == "factorized_multivariate_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
@@ -294,7 +297,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             )
             return prior_wb
 
-        if type == "block_diagonal_multivariate_normal":
+        if self._prior_type == "block_diagonal_multivariate_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
@@ -316,7 +319,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             )
             return prior_wb
 
-        if type == "multivariate_normal":
+        if self._prior_type == "multivariate_normal":
             self.prior_wb_loc = PyroParam(
                 init_value=torch.zeros(self._bnn.size_w + self._bnn.size_b),
                 constraint=constraints.real,
@@ -353,6 +356,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
     def prior_wb(self) -> dist.Distribution:
         return self._prior_wb(self)
 
+    @property
+    def prior_noise_stddev(self) -> dist.Distribution:
+        return self._prior_noise_stddev if self._infer_noise_stddev else None
+
     def forward(
         self, x: torch.tensor, y: Optional[torch.tensor] = None
     ) -> torch.tensor:
@@ -383,17 +390,6 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 )  # score mean predictions against ground truth
         return mean
 
-    def get_guide(self, guide: str) -> Optional[PyroModule]:
-        assert guide == "meta" or guide == "test" or guide == "prior"
-        if guide == "meta":
-            guide = self._meta_guide
-        elif guide == "test":
-            guide = self._guide
-        else:
-            guide = None
-
-        return guide
-
     def export_onnx(self, f) -> None:
         raise NotImplementedError  # not all ops we need are supported by onnx yet
         torch.onnx.export(
@@ -415,10 +411,20 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self.unfreeze_prior()
         self.train()
 
-        meta_guide = AutoDiagonalNormal(model=self)
+        # generate meta-guide
+        pyro.clear_param_store()  # to forget old guide shapes
+        # guide = AutoDiagonalNormal(model=self)
+        guide = AutoNormal(model=self)
+        # _initialize_guide(
+        #     model=self,
+        #     guide=meta_guide,
+        #     x=torch.tensor(x, dtype=torch.float),
+        #     y=torch.tensor(y, dtype=torch.float),
+        # )
+        # guide = MultiTaskBayesianNeuralNetworkGuide(model=self)
         epoch_losses = _train_model_svi(
             model=self,
-            guide=meta_guide,
+            guide=guide,
             x=torch.tensor(x, dtype=torch.float),
             y=torch.tensor(y, dtype=torch.float),
             n_epochs=n_epochs,
@@ -429,11 +435,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             log_identifier="meta_train",
         )
 
-        self._meta_guide = meta_guide
         self.eval()
         self.freeze_prior()
 
-        return epoch_losses.numpy()
+        return epoch_losses.numpy(), guide
 
     def adapt(
         self,
@@ -446,13 +451,24 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
     ) -> np.ndarray:
         self.train()
 
+        # generate new guide
+        pyro.clear_param_store()  # to forget old guide shapes
+        # guide = AutoDiagonalNormal(model=self)
+        guide = AutoNormal(model=self)
+        _reset_guide_to_prior(
+            model=self,
+            guide=guide,
+            x=torch.tensor(x, dtype=torch.float),
+            y=torch.tensor(y, dtype=torch.float),
+        )
+        # guide = MultiTaskBayesianNeuralNetworkGuide(model=self)
+
         n_context = x.shape[-2]
         if n_context == 0:
-            guide = None
+            # run guide once with dummy context data (but do not train it) to generate
+            # approximate posterior over unobserved latent sites
             epoch_losses = np.array([])
         else:
-            # TODO: do we have to clear the param store before intializing new guide?
-            guide = AutoDiagonalNormal(model=self)
             epoch_losses = _train_model_svi(
                 model=self,
                 guide=guide,
@@ -465,17 +481,18 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 wandb_run=wandb_run,
                 log_identifier=f"adapt",
             ).numpy()
-
-        self._guide = guide
         self.eval()
 
-        return epoch_losses
+        return epoch_losses, guide
 
     @torch.no_grad()
     def marginal_log_likelihood(
-        self, x: np.ndarray, y: np.ndarray, n_samples: int, guide_choice: str
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        n_samples: int,
+        guide: Optional[PyroModule],
     ):
-        guide = self.get_guide(guide=guide_choice)
         if guide is not None:
             assert guide.plates["tasks"].size == x.shape[0]
 
@@ -493,8 +510,12 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         return marg_ll
 
     @torch.no_grad()
-    def predict(self, x: np.ndarray, n_samples: int, guide: str) -> dict:
-        guide = self.get_guide(guide=guide)
+    def predict(
+        self,
+        x: np.ndarray,
+        n_samples: int,
+        guide: Optional[PyroModule],
+    ) -> dict:
         if guide is not None:
             assert guide.plates["tasks"].size == x.shape[0], (
                 f"x and guide have different numbers of tasks! "
@@ -518,3 +539,79 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         samples = {k: v.detach().cpu().numpy() for k, v in samples.items()}
 
         return samples
+
+
+def _reset_guide_to_prior(
+    model: MultiTaskBayesianNeuralNetwork,
+    guide: AutoNormal,
+    x=np.array,
+    y=np.array,
+):
+    assert model._prior_type == "factorized_normal"
+
+    # run guide once with dummy data (x, y could be empty)
+    guide(
+        x=torch.randn((x.shape[0], 1, x.shape[2])),
+        y=torch.randn((y.shape[0], 1, y.shape[2])),
+    )
+
+    # TODO: why are the guide-values not changed if I set them in a loop _wb[i][0] = ...
+    guide.locs._wb = model.prior_wb_loc.expand(guide.locs._wb.shape).detach().clone()
+    guide.scales._wb = (
+        model.prior_wb_scale.expand(guide.scales._wb.shape).detach().clone()
+    )
+
+
+# class MultiTaskBayesianNeuralNetworkGuide(PyroModule):
+#     """
+#     A variational posterior distribution for a multi-task Bayesian neural network.
+#     """
+
+#     def __init__(self, model: MultiTaskBayesianNeuralNetwork):
+#         super().__init__()
+
+#         assert model._prior_type == "factorized_normal"
+#         self._posterior_wb_loc = PyroParam(
+#             model.prior_wb_loc,
+#             constraint=constraints.real,
+#         )
+#         self._posterior_wb_scale = PyroParam(
+#             model.prior_wb_scale,
+#             constraint=constraints.positive,
+#         )
+#         self._infer_noise_stddev = model._infer_noise_stddev
+#         if self._infer_noise_stddev:
+#             self._posterior_noise_stddev_loc = PyroParam(
+#                 torch.tensor(0.5),
+#                 constraint=constraints.real,
+#             )
+#             self._posterior_noise_stddev_scale = PyroParam(
+#                 torch.tensor(0.1),
+#                 constraint=constraints.positive,
+#             )
+
+#     def forward(self, x: torch.tensor, y: torch.tensor):
+#         # shapes
+#         assert x.ndim == 3
+#         if y is not None:
+#             assert y.ndim == 3
+#         n_tasks = x.shape[0]
+
+#         if self._infer_noise_stddev:
+#             noise_stddev_unconstrained = pyro.sample(
+#                 "_noise_stddev_unconstrained",
+#                 dist.Normal(
+#                     self._posterior_noise_stddev_loc,
+#                     self._posterior_noise_stddev_scale,
+#                 ),
+#                 infer={"is_auxiliary": True},
+#             )
+
+#         with pyro.plate("tasks", n_tasks, dim=-2):
+#             pyro.sample(
+#                 "_wb",
+#                 dist.Normal(
+#                     self._posterior_wb_loc,
+#                     self._posterior_wb_scale,
+#                 ).to_event(1),
+#             )
