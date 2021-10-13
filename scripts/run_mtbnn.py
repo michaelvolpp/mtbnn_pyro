@@ -13,6 +13,7 @@ import wandb
 from matplotlib import pyplot as plt
 from wandb.sdk.wandb_init import init
 from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork
+from metalearning_benchmarks.benchmarks.util import normalize_benchmark
 from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
 from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
 from mtutils.mtutils import print_headline_string as prinths
@@ -44,6 +45,8 @@ def run_experiment(
         seed_x=config["seed_offset_train"] + 1,
         seed_noise=config["seed_offset_train"] + 2,
     )
+    if config["normalize_bm"]:
+        bm_meta = normalize_benchmark(benchmark=bm_meta)
     x_meta, y_meta = collate_data(bm=bm_meta)
     x_pred_meta = np.linspace(
         bm_meta.x_bounds[0, 0]
@@ -61,6 +64,8 @@ def run_experiment(
         seed_x=config["seed_offset_test"] + 1,
         seed_noise=config["seed_offset_test"] + 2,
     )
+    if config["normalize_bm"]:
+        bm_test = normalize_benchmark(benchmark=bm_test)
     x_test, y_test = collate_data(bm=bm_test)
     x_pred_test = np.linspace(
         bm_test.x_bounds[0, 0]
@@ -73,7 +78,7 @@ def run_experiment(
     ## create model
     if config["prior_type"] == "fixed":
         do_meta_training = False
-        prior_type = "isotropic_normal"
+        prior_type = "factorized_normal"
     else:
         do_meta_training = True
         prior_type = config["prior_type"]
@@ -84,6 +89,8 @@ def run_experiment(
         d_hidden=config["d_hidden"],
         noise_stddev=None if config["infer_noise_stddev"] else config["noise_stddev"],
         prior_type=prior_type,
+        prior_init=config["prior_init"],
+        posterior_init=config["posterior_init"],
     )
 
     ## obtain predictions on meta data before meta training
@@ -283,9 +290,10 @@ def run_experiment(
         if wandb_run.mode == "disabled":
             plt.show()
 
+
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "disabled")
+    wandb_mode = os.getenv("WANDB_MODE", "online")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
@@ -301,11 +309,14 @@ def main():
         n_points_per_task_test=128,
         seed_offset_train=1234,
         seed_offset_test=1235,
+        normalize_bm=True,
         # model
         n_hidden=1,
         d_hidden=8,
         infer_noise_stddev=True,
-        prior_type="factorized_normal",
+        prior_type="fixed",
+        prior_init="as_pytorch_linear",
+        posterior_init="pyro_standard",
         # training
         n_epochs=5000 if not smoke_test else 100,
         initial_lr=0.1,
@@ -315,8 +326,7 @@ def main():
         n_samples_pred=1000 if not smoke_test else 100,
         # evaluation
         n_contexts_pred=(
-            # [0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 128]
-            [0,  5, 10, 20, 50, 128]
+            [0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 128]
             if not smoke_test
             else [0, 5, 10, 50, 128]
         ),
