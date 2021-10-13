@@ -9,6 +9,7 @@ import pyro
 import torch
 from mtutils.mtutils import BatchedLinear, BatchedSequential, broadcast_xwb
 from pyro import distributions as dist
+from pyro import poutine
 from pyro.distributions import constraints
 from pyro.infer import Predictive, Trace_ELBO
 from pyro.infer.autoguide import AutoDiagonalNormal
@@ -160,6 +161,70 @@ def _train_model_svi(
     return torch.tensor(train_losses)
 
 
+def _train_prior_monte_carlo(
+    model: PyroModule,
+    x: torch.tensor,
+    y: torch.tensor,
+    n_samples: int,
+    n_epochs: int,
+    initial_lr: float,
+    wandb_run,
+    log_identifier: str,
+    final_lr: Optional[float] = None,
+) -> torch.tensor:
+    # watch model exectuion with wandb
+    wandb_run.watch(model, log="all")
+
+    ## get parameters
+    pyro.clear_param_store()  # to forget old guide shapes
+    params = list(model.parameters())
+
+    ## optimizer
+    # use the same tweaks as Pyro's ClippedAdam: LR decay and gradient clipping
+    # (gradient clipping is implemented in the training loop itself)
+    optim = AdamTorch(params=params, lr=initial_lr)
+    if final_lr is not None:
+        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+        lr_decay = gamma ** (1 / n_epochs)
+        lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
+    else:
+        lr_scheduler = None
+
+    ## training loop
+    train_losses = []
+    for i in range(n_epochs):
+        optim.zero_grad()
+
+        # compute loss
+        loss = -_differentiable_prior_marginal_log_likelihood(
+            model=model, x=x, y=y, n_samples=n_samples
+        )
+
+        # compute gradients and step
+        loss.backward()
+        clip_grad_norm_(params, max_norm=10.0)  # gradient clipping
+        optim.step()
+
+        # adapt lr
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        # logging
+        train_losses.append(loss.item())
+        # TODO: find neater way to log parametric learning curve
+        n_context = x.shape[-2]
+        wandb_run.log(
+            {
+                f"{log_identifier}/epoch": i,
+                f"{log_identifier}/loss_n_context_{n_context:03d}": loss,
+            }
+        )
+        if i % 100 == 0 or i == len(range(n_epochs)) - 1:
+            print(f"[iter {i:04d}] marg_ll = {-loss:.4e}")
+
+    return torch.tensor(train_losses)
+
+
 def _marginal_log_likelihood(
     model: PyroModule,
     guide: PyroModule,
@@ -178,6 +243,42 @@ def _marginal_log_likelihood(
         parallel=True,
     )
     model_trace = predictive.get_vectorized_trace(x=x, y=y)
+
+    # compute log-likelihood for the observation sites
+    obs_site = model_trace.nodes["obs"]
+    log_prob = obs_site["fn"].log_prob(obs_site["value"])  # reduces event-dims
+    n_task = x.shape[0]
+    n_pts = x.shape[1]
+    assert log_prob.shape == (n_samples, n_task, n_pts)
+
+    # compute predictive likelihood
+    log_prob = torch.sum(log_prob, dim=2, keepdim=True)  # sum pts-per-task dim
+    log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # reduce sampledim
+    log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # sum task dim
+    assert log_prob.shape == (1, 1, 1)
+    log_prob = log_prob.squeeze_()
+    log_prob = log_prob - n_task * torch.log(torch.tensor(n_samples))
+
+    # normalize w.r.t. number of datapoints
+    log_prob = log_prob / n_task / n_pts
+
+    return log_prob
+
+
+def _differentiable_prior_marginal_log_likelihood(
+    model: PyroModule,
+    x: torch.tensor,
+    y: torch.tensor,
+    n_samples: int,
+) -> torch.tensor:
+    """
+    Computes predictive log-likelihood using latent samples from prior.
+    Does not use Predictive as Predictive wraps execution in torch.no_grad() and we
+    require gradients here
+    """
+    # obtain trace for n_samples model executions
+    vectorized_model = pyro.plate("samples", size=n_samples, dim=-3)(model)
+    model_trace = poutine.trace(vectorized_model).get_trace(x=x, y=y)
 
     # compute log-likelihood for the observation sites
     obs_site = model_trace.nodes["obs"]
