@@ -5,6 +5,7 @@ implementation.
 
 import os
 
+import torch
 import numpy as np
 import pyro
 import wandb
@@ -77,6 +78,7 @@ def run_experiment(
         do_meta_training = True
         prior_type = config["prior_type"]
     mtbnn = MultiTaskBayesianNeuralNetwork(
+        device=config["device"],
         d_x=bm_meta.d_x,
         d_y=bm_meta.d_y,
         n_hidden=config["n_hidden"],
@@ -206,6 +208,7 @@ def main():
     config = dict(
         model="MTBNN",
         seed_pyro=123,
+        device="cuda" if torch.cuda.is_available() else "cpu",
         # benchmarks
         bm="Quadratic1D",
         noise_stddev=0.01,

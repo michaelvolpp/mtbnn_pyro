@@ -325,6 +325,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         prior_init: str,
         posterior_init: str,
         noise_stddev: Optional[float] = None,
+        device: str = "cpu",
     ):
         super().__init__()
 
@@ -333,6 +334,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self._d_y = d_y
         self._n_hidden = n_hidden
         self._d_hidden = d_hidden
+        self._device = device
         assert (
             prior_type in _allowed_prior_types
         ), f"Unknown prior type '{prior_type}'! "
@@ -372,6 +374,9 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         ## set evaluation mode
         self.freeze_prior()
         self.eval()
+
+        ## set device
+        self.to(device)
 
     def _create_bnn_priors(self) -> dist.Distribution:
         if self._prior_type == "isotropic_normal":
@@ -502,16 +507,16 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
 
     def _initialize_guide(
         self,
-        x: np.ndarray,
-        y: np.ndarray,
+        x: torch.tensor,
+        y: torch.tensor,
     ):
         assert self._prior_type == "factorized_normal"
-        guide = AutoNormal(self)
+        guide = AutoNormal(self).to(self._device)
 
         # run guide once with dummy data (x, y could be empty)
         guide(
-            x=torch.randn((x.shape[0], 1, x.shape[2])),
-            y=torch.randn((y.shape[0], 1, y.shape[2])),
+            x=torch.randn((x.shape[0], 1, x.shape[2]), device=self._device),
+            y=torch.randn((y.shape[0], 1, y.shape[2]), device=self._device),
         )
 
         if self._posterior_init == "set_to_prior":
@@ -605,14 +610,14 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         # generate meta-guide
         pyro.clear_param_store()  # to forget old guide shapes
         guide = self._initialize_guide(
-            x=torch.tensor(x, dtype=torch.float),
-            y=torch.tensor(y, dtype=torch.float),
+            x=torch.tensor(x, dtype=torch.float, device=self._device),
+            y=torch.tensor(y, dtype=torch.float, device=self._device),
         )
         epoch_losses = _train_model_svi(
             model=self,
             guide=guide,
-            x=torch.tensor(x, dtype=torch.float),
-            y=torch.tensor(y, dtype=torch.float),
+            x=torch.tensor(x, dtype=torch.float, device=self._device),
+            y=torch.tensor(y, dtype=torch.float, device=self._device),
             n_epochs=n_epochs,
             initial_lr=initial_lr,
             final_lr=final_lr,
@@ -641,8 +646,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
 
         epoch_losses = _train_model_monte_carlo(
             model=self,
-            x=torch.tensor(x, dtype=torch.float),
-            y=torch.tensor(y, dtype=torch.float),
+            x=torch.tensor(x, dtype=torch.float, device=self._device),
+            y=torch.tensor(y, dtype=torch.float, device=self._device),
             n_epochs=n_epochs,
             n_samples=n_samples,
             initial_lr=initial_lr,
@@ -670,8 +675,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         # generate new guide
         pyro.clear_param_store()  # to forget old guide shapes
         guide = self._initialize_guide(
-            x=torch.tensor(x, dtype=torch.float),
-            y=torch.tensor(y, dtype=torch.float),
+            x=torch.tensor(x, dtype=torch.float, device=self._device),
+            y=torch.tensor(y, dtype=torch.float, device=self._device),
         )
 
         n_context = x.shape[-2]
@@ -681,8 +686,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             epoch_losses = _train_model_svi(
                 model=self,
                 guide=guide,
-                x=torch.tensor(x, dtype=torch.float),
-                y=torch.tensor(y, dtype=torch.float),
+                x=torch.tensor(x, dtype=torch.float, device=self._device),
+                y=torch.tensor(y, dtype=torch.float, device=self._device),
                 n_epochs=n_epochs,
                 initial_lr=initial_lr,
                 final_lr=final_lr,
@@ -710,8 +715,8 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             marg_ll = _marginal_log_likelihood(
                 model=self,
                 guide=guide,
-                x=torch.tensor(x, dtype=torch.float),
-                y=torch.tensor(y, dtype=torch.float),
+                x=torch.tensor(x, dtype=torch.float, device=self._device),
+                y=torch.tensor(y, dtype=torch.float, device=self._device),
                 n_samples=n_samples,
             ).numpy()
         else:
@@ -745,7 +750,9 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 "_noise_stddev",
             ),
         )
-        samples = predictive(x=torch.tensor(x, dtype=torch.float), y=None)
+        samples = predictive(
+            x=torch.tensor(x, dtype=torch.float, device=self._device), y=None
+        )
         samples = {k: v.detach().cpu().numpy() for k, v in samples.items()}
 
         return samples
