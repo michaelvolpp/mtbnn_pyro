@@ -385,7 +385,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 self._device
             )
         else:
-            self._noise_stddev = self._noise_stddev.to_(self._device)
+            self._noise_stddev = self._noise_stddev.to(self._device)
 
     def _create_bnn_priors(self) -> dist.Distribution:
         if self._prior_type == "isotropic_normal":

@@ -83,7 +83,7 @@ def run_experiment(
         d_y=bm_meta.d_y,
         n_hidden=config["n_hidden"],
         d_hidden=config["d_hidden"],
-        noise_stddev=None if config["infer_noise_stddev"] else config["noise_stddev"],
+        noise_stddev=None if config["infer_noise_stddev"] else config["noise_stddev_model"],
         prior_type=prior_type,
         prior_init=config["prior_init"],
         posterior_init="set_to_prior",  # not relevant for this experiment
@@ -222,7 +222,8 @@ def main():
         # model
         n_hidden=1,
         d_hidden=8,
-        infer_noise_stddev=True,
+        infer_noise_stddev=False,
+        noise_stddev_model=1.0,
         prior_type="factorized_normal",
         prior_init="as_pytorch_linear",
         # training
