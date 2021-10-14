@@ -201,8 +201,8 @@ def run_experiment(
 
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "disabled")
-    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
+    wandb_mode = os.getenv("WANDB_MODE", "online")
+    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(
@@ -210,7 +210,7 @@ def main():
         seed_pyro=123,
         device="cuda" if torch.cuda.is_available() else "cpu",
         # benchmarks
-        bm="Quadratic1D",
+        bm="Affine1D",
         noise_stddev=0.01,
         n_tasks_meta=8,
         n_points_per_task_meta=16,
