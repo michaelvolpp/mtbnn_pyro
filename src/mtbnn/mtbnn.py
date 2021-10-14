@@ -378,9 +378,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         ## set device
         self.to(self._device)
         if self._infer_noise_stddev:
-            self._prior_noise_stddev.low = self._prior_noise_stddev.low.to(
-                self._device
-            )
+            self._prior_noise_stddev.low = self._prior_noise_stddev.low.to(self._device)
             self._prior_noise_stddev.high = self._prior_noise_stddev.high.to(
                 self._device
             )
@@ -546,6 +544,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
     @property
     def prior_noise_stddev(self) -> dist.Distribution:
         return self._prior_noise_stddev if self._infer_noise_stddev else None
+
+    def set_noise_stddev(self, noise_stddev: float) -> None:
+        assert not self._infer_noise_stddev
+        self._noise_stddev = torch.tensor(noise_stddev, device=self._device)
 
     def freeze_prior(self) -> None:
         """
@@ -722,13 +724,17 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
             assert guide.plates["tasks"].size == x.shape[0]
 
         if x.size > 0:
-            marg_ll = _marginal_log_likelihood(
-                model=self,
-                guide=guide,
-                x=torch.tensor(x, dtype=torch.float, device=self._device),
-                y=torch.tensor(y, dtype=torch.float, device=self._device),
-                n_samples=n_samples,
-            ).cpu().numpy()
+            marg_ll = (
+                _marginal_log_likelihood(
+                    model=self,
+                    guide=guide,
+                    x=torch.tensor(x, dtype=torch.float, device=self._device),
+                    y=torch.tensor(y, dtype=torch.float, device=self._device),
+                    n_samples=n_samples,
+                )
+                .cpu()
+                .numpy()
+            )
         else:
             marg_ll = np.nan
 

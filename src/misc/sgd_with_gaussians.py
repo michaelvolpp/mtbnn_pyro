@@ -97,13 +97,13 @@ var_ML = torch.mean((thetas - mu_ML) ** 2)
 
 # initialize model
 mu_init = 3 * mu_true
-sigma_init = 0.1
+sigma_init = 1.0
 mu = torch.tensor(mu_init, requires_grad=True)
 var = torch.tensor(sigma_init ** 2, requires_grad=True)
 
 # optimize
 n_iter = 10000
-lr = 1.0
+lr = 0.01
 # optim = torch.optim.SGD(params=[mu, var], lr=lr)
 # optim = torch.optim.LBFGS(params=[mu, var], lr=lr)
 optim = torch.optim.Adam(params=[mu, var], lr=lr)
@@ -119,6 +119,9 @@ for i in range(n_iter):
             scale=torch.sqrt(var),
         ).log_prob(thetas)
         loss = -log_probs.sum()
+        # cf. https://openreview.net/pdf?id=aPOpXlnV1T
+        # sigma = sigma_n if isinstance(sigma_n, float) else sigma_n.detach()
+        # loss = loss * sigma**2
         loss.backward()
         return loss
 

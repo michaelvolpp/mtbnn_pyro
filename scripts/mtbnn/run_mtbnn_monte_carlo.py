@@ -83,7 +83,9 @@ def run_experiment(
         d_y=bm_meta.d_y,
         n_hidden=config["n_hidden"],
         d_hidden=config["d_hidden"],
-        noise_stddev=None if config["infer_noise_stddev"] else config["noise_stddev_model"],
+        noise_stddev=None
+        if config["infer_noise_stddev"]
+        else config["noise_stddev"],
         prior_type=prior_type,
         prior_init=config["prior_init"],
         posterior_init="set_to_prior",  # not relevant for this experiment
@@ -91,7 +93,7 @@ def run_experiment(
 
     ## obtain predictions on meta data before meta training
     samples_prior_meta_untrained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_pred_meta, n_samples=config["n_samples_marg_ll"], guide=None
     )
     pred_summary_prior_meta_untrained = summarize_samples(
         samples=samples_prior_meta_untrained
@@ -99,10 +101,10 @@ def run_experiment(
 
     ## compute marginal likelihood before training
     marg_ll_meta_untrained = mtbnn.marginal_log_likelihood(
-        x=x_meta, y=y_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_meta, y=y_meta, n_samples=config["n_samples_marg_ll"], guide=None
     )
     marg_ll_test_untrained = mtbnn.marginal_log_likelihood(
-        x=x_test, y=y_test, n_samples=config["n_samples_pred"], guide=None
+        x=x_test, y=y_test, n_samples=config["n_samples_marg_ll"], guide=None
     )
 
     ## print prior parameters
@@ -112,15 +114,17 @@ def run_experiment(
     ## meta training
     prinths("Performing Meta Training...")
     if do_meta_training:
+        mtbnn.set_noise_stddev(config["noise_stddev_train"])
         learning_curve_meta = mtbnn.meta_train_monte_carlo(
             x=x_meta,
             y=y_meta,
             n_epochs=config["n_epochs"],
-            n_samples=config["n_samples_pred"],
+            n_samples=config["n_samples_marg_ll"],
             initial_lr=config["initial_lr"],
             final_lr=config["final_lr"],
             wandb_run=wandb_run,
         )
+        mtbnn.set_noise_stddev(config["noise_stddev"])
     else:
         print("No meta training performed!")
         learning_curve_meta = None
@@ -137,7 +141,7 @@ def run_experiment(
     ## obtain predictions on meta data after training
     # obtain prior predictions
     samples_prior_meta_trained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_pred_meta, n_samples=config["n_samples_marg_ll"], guide=None
     )
     pred_summary_prior_meta_trained = summarize_samples(
         samples=samples_prior_meta_trained
@@ -145,10 +149,10 @@ def run_experiment(
 
     ## compute marginal likelihood after training
     marg_ll_meta_trained = mtbnn.marginal_log_likelihood(
-        x=x_meta, y=y_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_meta, y=y_meta, n_samples=config["n_samples_marg_ll"], guide=None
     )
     marg_ll_test_trained = mtbnn.marginal_log_likelihood(
-        x=x_test, y=y_test, n_samples=config["n_samples_pred"], guide=None
+        x=x_test, y=y_test, n_samples=config["n_samples_marg_ll"], guide=None
     )
 
     ## print freezed parameters
@@ -201,7 +205,7 @@ def run_experiment(
 
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "online")
+    wandb_mode = os.getenv("WANDB_MODE", "disabled")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
@@ -223,7 +227,7 @@ def main():
         n_hidden=1,
         d_hidden=8,
         infer_noise_stddev=False,
-        noise_stddev_model=1.0,
+        noise_stddev_train=1.0,
         prior_type="factorized_normal",
         prior_init="as_pytorch_linear",
         # training
@@ -232,6 +236,7 @@ def main():
         final_lr=0.00001,
         n_points_pred=100,
         n_samples_pred=1000 if not smoke_test else 100,
+        n_samples_marg_ll=10000 if not smoke_test else 100,
         # plot
         plot=True,
         max_tasks_plot=np.inf,
