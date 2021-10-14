@@ -378,10 +378,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         ## set device
         self.to(self._device)
         if self._infer_noise_stddev:
-            self._prior_noise_stddev.low = self._prior_noise_stddev.low.to_(
+            self._prior_noise_stddev.low = self._prior_noise_stddev.low.to(
                 self._device
             )
-            self._prior_noise_stddev.high = self._prior_noise_stddev.high.to_(
+            self._prior_noise_stddev.high = self._prior_noise_stddev.high.to(
                 self._device
             )
         else:
