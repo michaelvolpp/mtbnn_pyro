@@ -171,7 +171,7 @@ def _train_model_svi(
     return torch.tensor(train_losses)
 
 
-def _train_prior_monte_carlo(
+def _train_model_monte_carlo(
     model: PyroModule,
     x: torch.tensor,
     y: torch.tensor,
@@ -186,7 +186,6 @@ def _train_prior_monte_carlo(
     wandb_run.watch(model, log="all")
 
     ## get parameters
-    pyro.clear_param_store()  # to forget old guide shapes
     params = list(model.parameters())
 
     ## optimizer
@@ -626,6 +625,36 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self.freeze_prior()
 
         return epoch_losses.numpy(), guide
+
+    def meta_train_monte_carlo(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        n_epochs: int,
+        n_samples: int,
+        initial_lr: float,
+        final_lr: float,
+        wandb_run,
+    ) -> np.ndarray:
+        self.unfreeze_prior()
+        self.train()
+
+        epoch_losses = _train_model_monte_carlo(
+            model=self,
+            x=torch.tensor(x, dtype=torch.float),
+            y=torch.tensor(y, dtype=torch.float),
+            n_epochs=n_epochs,
+            n_samples=n_samples,
+            initial_lr=initial_lr,
+            final_lr=final_lr,
+            wandb_run=wandb_run,
+            log_identifier="meta_train_monte_carlo",
+        )
+
+        self.eval()
+        self.freeze_prior()
+
+        return epoch_losses.numpy()
 
     def adapt(
         self,

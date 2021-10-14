@@ -18,7 +18,7 @@ from mtutils.mtutils import print_headline_string as prinths
 from mtutils.mtutils import print_pyro_parameters, split_tasks, summarize_samples
 from wandb.sdk.wandb_init import init
 
-from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork, _train_prior_monte_carlo
+from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork, _train_model_monte_carlo
 from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
 
 
@@ -114,21 +114,15 @@ def run_experiment(
     ## meta training
     prinths("Performing Meta Training...")
     if do_meta_training:
-        mtbnn.train()
-        mtbnn.unfreeze_prior()
-        learning_curve_meta = _train_prior_monte_carlo(
-            model=mtbnn,
-            x=torch.tensor(x_meta, dtype=torch.float32),
-            y=torch.tensor(y_meta, dtype=torch.float32),
+        learning_curve_meta = mtbnn.meta_train_monte_carlo(
+            x=x_meta,
+            y=y_meta,
             n_epochs=config["n_epochs"],
             n_samples=config["n_samples_pred"],
             initial_lr=config["initial_lr"],
             final_lr=config["final_lr"],
             wandb_run=wandb_run,
-            log_identifier="meta_train_monte_carlo",
         )
-        mtbnn.freeze_prior()
-        mtbnn.eval()
     else:
         print("No meta training performed!")
         learning_curve_meta = None
