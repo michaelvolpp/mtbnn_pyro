@@ -4,22 +4,18 @@ implementation.
 """
 
 import os
-import warnings
-from sys import int_info
 
 import numpy as np
 import pyro
-import torch
 import wandb
 from matplotlib import pyplot as plt
 from metalearning_benchmarks.benchmarks.util import normalize_benchmark
-from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
+from mtutils.mtutils import BM_DICT, collate_data
 from mtutils.mtutils import print_headline_string as prinths
-from mtutils.mtutils import print_pyro_parameters, split_tasks, summarize_samples
-from wandb.sdk.wandb_init import init
+from mtutils.mtutils import print_pyro_parameters, summarize_samples
 
-from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork, _train_model_monte_carlo
-from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
+from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork
+from mtbnn.plotting import plot_metrics, plot_predictions
 
 
 def run_experiment(
