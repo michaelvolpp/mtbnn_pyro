@@ -364,10 +364,10 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self._infer_noise_stddev = noise_stddev is None
         if self._infer_noise_stddev:
             # TODO: learn noise prior?
-            self._prior_noise_stddev = dist.Uniform(0.0, 1.0)
+            self._prior_noise_stddev = dist.Uniform(0.0 + 1e-6, 1.0)
             self._noise_stddev = PyroSample(self._prior_noise_stddev)
         else:
-            self._noise_stddev = noise_stddev
+            self._noise_stddev = torch.tensor(noise_stddev)
 
         ## set evaluation mode
         self.freeze_prior()
@@ -639,6 +639,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
         self.unfreeze_prior()
         self.train()
 
+        pyro.clear_param_store()
         epoch_losses = _train_model_monte_carlo(
             model=self,
             x=torch.tensor(x, dtype=torch.float),
