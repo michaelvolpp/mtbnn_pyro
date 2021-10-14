@@ -727,7 +727,7 @@ class MultiTaskBayesianNeuralNetwork(PyroModule):
                 x=torch.tensor(x, dtype=torch.float, device=self._device),
                 y=torch.tensor(y, dtype=torch.float, device=self._device),
                 n_samples=n_samples,
-            ).numpy()
+            ).cpu().numpy()
         else:
             marg_ll = np.nan
 
