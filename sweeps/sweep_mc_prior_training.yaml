@@ -20,5 +20,9 @@ parameters:
       values: [100, 1000, 10000]
     n_samples_eval:
       values: [100, 1000, 10000]
-    n_task_meta:
+    n_tasks_meta:
       values: [1, 4, 8, 16]
+    normalize_bm:
+      values: [True, False]
+    prior_init:
+      values: ["standard_normal", "as_pytorch_linear"]
