@@ -212,7 +212,8 @@ def main():
     config = dict(
         model="MTBNN",
         seed_pyro=123,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        # device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cpu",
         # benchmarks
         bm="Affine1D",
         noise_stddev=0.01,
