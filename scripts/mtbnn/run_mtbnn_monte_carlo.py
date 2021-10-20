@@ -91,7 +91,7 @@ def run_experiment(
 
     ## obtain predictions on meta data before meta training
     samples_prior_meta_untrained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_pred_meta, n_samples=config["n_samples_eval"], guide=None
     )
     pred_summary_prior_meta_untrained = summarize_samples(
         samples=samples_prior_meta_untrained
@@ -99,10 +99,10 @@ def run_experiment(
 
     ## compute marginal likelihood before training
     marg_ll_meta_untrained = mtbnn.marginal_log_likelihood(
-        x=x_meta, y=y_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_meta, y=y_meta, n_samples=config["n_samples_eval"], guide=None
     )
     marg_ll_test_untrained = mtbnn.marginal_log_likelihood(
-        x=x_test, y=y_test, n_samples=config["n_samples_pred"], guide=None
+        x=x_test, y=y_test, n_samples=config["n_samples_eval"], guide=None
     )
 
     ## print prior parameters
@@ -117,7 +117,7 @@ def run_experiment(
             x=x_meta,
             y=y_meta,
             n_epochs=config["n_epochs"],
-            n_samples=config["n_samples_pred"],
+            n_samples=config["n_samples_train"],
             initial_lr=config["initial_lr"],
             final_lr=config["final_lr"],
             wandb_run=wandb_run,
@@ -139,7 +139,7 @@ def run_experiment(
     ## obtain predictions on meta data after training
     # obtain prior predictions
     samples_prior_meta_trained = mtbnn.predict(
-        x=x_pred_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_pred_meta, n_samples=config["n_samples_eval"], guide=None
     )
     pred_summary_prior_meta_trained = summarize_samples(
         samples=samples_prior_meta_trained
@@ -147,10 +147,10 @@ def run_experiment(
 
     ## compute marginal likelihood after training
     marg_ll_meta_trained = mtbnn.marginal_log_likelihood(
-        x=x_meta, y=y_meta, n_samples=config["n_samples_pred"], guide=None
+        x=x_meta, y=y_meta, n_samples=config["n_samples_eval"], guide=None
     )
     marg_ll_test_trained = mtbnn.marginal_log_likelihood(
-        x=x_test, y=y_test, n_samples=config["n_samples_pred"], guide=None
+        x=x_test, y=y_test, n_samples=config["n_samples_eval"], guide=None
     )
 
     ## print freezed parameters
@@ -235,7 +235,8 @@ def main():
         initial_lr=0.1,
         final_lr=0.00001,
         n_points_pred=100,
-        n_samples_pred=1000 if not smoke_test else 100,
+        n_samples_train=1000 if not smoke_test else 100,
+        n_samples_eval=1000 if not smoke_test else 100,
         # plot
         plot=True,
         max_tasks_plot=np.inf,
