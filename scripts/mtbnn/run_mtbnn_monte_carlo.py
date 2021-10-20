@@ -83,9 +83,7 @@ def run_experiment(
         d_y=bm_meta.d_y,
         n_hidden=config["n_hidden"],
         d_hidden=config["d_hidden"],
-        noise_stddev=None
-        if config["infer_noise_stddev"]
-        else config["noise_stddev"],
+        noise_stddev=None if config["infer_noise_stddev"] else config["noise_stddev"],
         prior_type=prior_type,
         prior_init=config["prior_init"],
         posterior_init="set_to_prior",  # not relevant for this experiment
@@ -202,10 +200,12 @@ def run_experiment(
         if wandb_run.mode == "disabled":
             plt.show()
 
+# compare single-task marg ll w/ multi task (broader prior)
+# effect of sigma_n on learning
 
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "disabled")
+    wandb_mode = os.getenv("WANDB_MODE", "online")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
@@ -216,7 +216,7 @@ def main():
         # benchmarks
         bm="Affine1D",
         noise_stddev=0.01,
-        n_tasks_meta=8,
+        n_tasks_meta=1,
         n_points_per_task_meta=16,
         n_tasks_test=128,
         n_points_per_task_test=128,

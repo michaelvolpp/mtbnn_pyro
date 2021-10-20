@@ -10,7 +10,7 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from mtutils.mtutils import print_pyro_parameters
 
-SIGMA_N = 0.1
+SIGMA_N = 0.01
 
 
 class Model(PyroModule):
@@ -24,7 +24,7 @@ class Model(PyroModule):
             init_value=torch.tensor([0.0]),
             constraint=constraints.real,
         )
-        self.mu.requires_grad = False
+        # self.mu.requires_grad = False
         self.sigma = PyroParam(
             init_value=torch.tensor([init_sigma]),
             constraint=constraints.positive,
@@ -143,7 +143,7 @@ def main():
     # model
     correlated = False
 
-    # TODO: understand this!
+    # # TODO: understand this!
     # print("*" * 100)
     # model = Model(init_sigma=1.0, correlated=correlated)
     # print(
@@ -157,7 +157,7 @@ def main():
     # print("*" * 100)
     # model = Model(init_sigma=0.1, correlated=correlated)
     # print(
-    #     f"model2-ll (sampled) = {marginal_log_likelihood(model=model, y=y, n_samples=10000)}"
+    #     f"model2-ll (sampled) = {marginal_log_likelihood(model=model, y=y, n_samples=1000000)}"
     # )
     # print(f"model2-ll (true)    = {true_marginal_log_likelihood(model=model, y=y)}")
     # print_pyro_parameters()

@@ -18,7 +18,7 @@ def plot_predictions_for_one_set_of_tasks(
     max_tasks: int,
     pred_summary: Optional[dict] = None,
     samples: Optional[dict] = None,
-    max_samples: Optional[int] = 10,
+    max_samples: Optional[int] = 100,
     n_context: Optional[np.ndarray] = None,
 ):
     assert not (pred_summary is None and samples is None)
