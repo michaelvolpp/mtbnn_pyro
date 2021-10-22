@@ -1,0 +1,25 @@
+name: test_disown 
+description: |
+  Toy sweep to test how to properly close ssh-shells without stopping sweep.
+project: mtbnn_mc
+program: run_mtbnn_monte_carlo.py
+method: grid 
+parameters: 
+    bm: 
+      values: ["Affine1D", "Quadratic1D", "Sinusoid1D"]
+    seed_pyro: 
+      values: [123, 223, 323]
+    noise_stddev_train:
+      values: [0.01, 0.1, 1.0]
+    n_samples_train:
+      value: 100
+    n_samples_eval:
+      value: 100
+    n_epochs:
+      value: 1000
+    n_tasks_meta:
+      values: [1, 4, 8, 16]
+    normalize_bm:
+      values: [True, False]
+    prior_init:
+      values: ["standard_normal", "as_pytorch_linear"]
