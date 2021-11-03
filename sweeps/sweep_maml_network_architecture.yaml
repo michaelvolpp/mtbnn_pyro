@@ -9,7 +9,7 @@ parameters:
       value: ["MAML"]
     bm: 
       values: ["Affine1D", "Quadratic1D", "Sinusoid1D"]
-    seed_pyro: 
+    seed: 
       values: [123, 223, 323]
     n_tasks_meta:
       values: [8, 16, 32]
