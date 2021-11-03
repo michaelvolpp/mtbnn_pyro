@@ -1,8 +1,8 @@
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
-from torch.nn import Linear, Module, MSELoss, Sequential, Tanh
+from torch.nn import Linear, Module, MSELoss, Sequential, Tanh, ReLU
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ExponentialLR
@@ -11,23 +11,32 @@ from torch.optim.lr_scheduler import ExponentialLR
 def _create_mlp(
     d_x: int,
     d_y: int,
-    n_hidden: int,
-    d_hidden: int,
+    f_act: str,
+    hidden_units: List[int],
 ) -> Module:
     """
     Generate a vanilla MLP Torch module.
     """
+    if f_act == "relu":
+        f_act = ReLU
+    elif f_act == "tanh":
+        f_act = Tanh
+    else:
+        raise ValueError(f"Unknown activation function f_act = {f_act}!")
 
+    n_hidden = len(hidden_units)
     layers = []
     if n_hidden == 0:  # linear model
         layers.append(Linear(in_features=d_x, out_features=d_y))
     else:  # fully connected MLP
-        layers.append(Linear(in_features=d_x, out_features=d_hidden))
-        layers.append(Tanh())
-        for _ in range(n_hidden - 1):
-            layers.append(Linear(in_features=d_hidden, out_features=d_hidden))
-            layers.append(Tanh())
-        layers.append(Linear(in_features=d_hidden, out_features=d_y))
+        layers.append(Linear(in_features=d_x, out_features=hidden_units[0]))
+        layers.append(f_act())
+        for i in range(n_hidden - 1):
+            layers.append(
+                Linear(in_features=hidden_units[i], out_features=hidden_units[i + 1])
+            )
+            layers.append(f_act())
+        layers.append(Linear(in_features=hidden_units[-1], out_features=d_y))
     net = Sequential(*layers)
 
     return net
@@ -118,21 +127,33 @@ class MultiLayerPerceptron(Module):
         self,
         d_x: int,
         d_y: int,
-        n_hidden: int,
-        d_hidden: int,
+        f_act: str = "tanh",
+        n_hidden: Optional[int] = None,
+        d_hidden: Optional[int] = None,
+        hidden_units: Optional[List[int]] = None,
     ):
+        if n_hidden is None:
+            assert d_hidden is None
+            assert hidden_units is not None
+        if hidden_units is None:
+            assert d_hidden is not None
+            assert n_hidden is not None
+            hidden_units = [d_hidden] * n_hidden
+
         super().__init__()
-        self.d_x, self.d_y, self.n_hidden, self.d_hidden = d_x, d_y, n_hidden, d_hidden
+        self.d_x, self.d_y, self.hidden_units, self.f_act = (
+            d_x,
+            d_y,
+            hidden_units,
+            f_act,
+        )
         self._reset()
         self.eval()
 
     def _reset(self):
         # TODO: is this correctly registered?
         self._mlp = _create_mlp(
-            d_x=self.d_x,
-            d_y=self.d_y,
-            n_hidden=self.n_hidden,
-            d_hidden=self.d_hidden,
+            d_x=self.d_x, d_y=self.d_y, hidden_units=self.hidden_units, f_act=self.f_act
         )
 
     def forward(self, x: torch.tensor) -> torch.tensor:
@@ -186,4 +207,4 @@ class MultiLayerPerceptron(Module):
 
     @torch.no_grad()
     def predict(self, x: np.ndarray):
-        return self(torch.tensor(x, dtype=torch.float))
+        return self(torch.tensor(x, dtype=torch.float)).numpy()

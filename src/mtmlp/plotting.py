@@ -67,6 +67,7 @@ def plot_predictions(
     y_preds,
     n_contexts_plot,
     max_tasks,
+    dataset_name = "test",
 ):
     fig, axes = plt.subplots(
         nrows=1,
@@ -86,7 +87,7 @@ def plot_predictions(
         ax = axes[0, plt_ct]
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title(f"Prediction\n(test data, n_ctx={n_context:d})")
+        ax.set_title(f"Prediction\n({dataset_name} data, n_ctx={n_context:d})")
         plot_predictions_for_one_set_of_tasks(
             x=x,
             y=y,

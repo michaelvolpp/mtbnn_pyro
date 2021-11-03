@@ -140,7 +140,7 @@ def _mse(model: Module, x: torch.tensor, y: torch.tensor) -> torch.tensor:
     Computes predictive MSE of model on data (x, y).
     """
     pred = model(x)
-    mse = MSELoss()(pred, y)
+    mse = MSELoss(reduction="mean")(pred, y)
 
     return mse
 

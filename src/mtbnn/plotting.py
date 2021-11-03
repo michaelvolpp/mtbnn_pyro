@@ -423,13 +423,28 @@ def plot_distributions(
 
 
 def plot_metrics(
-    learning_curve_meta, learning_curves_test, lls, lls_context, n_contexts
+    learning_curve_meta,
+    learning_curves_test=None,
+    rmses=None,
+    rmses_context=None,
+    lls=None,
+    lls_context=None,
+    n_contexts=None,
 ):
-    n_plots = 3 if learning_curves_test is not None else 1
+    n_plots = 1
+    if learning_curves_test is not None:
+        n_plots += 1
+    if rmses is not None:
+        assert rmses_context is not None
+        n_plots += 1
+    if lls is not None:
+        assert lls_context is not None
+        n_plots += 1
     fig, axes = plt.subplots(nrows=1, ncols=n_plots, figsize=(16, 8), squeeze=False)
     fig.suptitle("Metrics")
 
-    ax = axes[0, 0]
+    ax_ct = 0
+    ax = axes[0, ax_ct]
     ax.set_title("Learning Curve (meta training)")
     ax.set_xlabel("epoch")
     ax.set_ylabel("loss")
@@ -441,10 +456,11 @@ def plot_metrics(
         )
         ax.legend()
     ax.grid()
+    ax_ct += 1
 
     if learning_curves_test is not None:
-        ax = axes[0, 1]
-        ax.set_title("Learning Curve (adaptation)")
+        ax = axes[0, ax_ct]
+        ax.set_title("Learning Curves (adaptation)")
         ax.set_xlabel("epoch")
         ax.set_ylabel("loss")
         ax.set_yscale("symlog")  # TODO: think about symlog scaling
@@ -456,9 +472,10 @@ def plot_metrics(
             )
         ax.legend()
         ax.grid()
+        ax_ct += 1
 
     if lls is not None:
-        ax = axes[0, 2]
+        ax = axes[0, ax_ct]
         ax.set_title("Marginal Log-Likelihood")
         ax.set_xlabel("n_context")
         ax.set_xticks(n_contexts)
@@ -467,6 +484,19 @@ def plot_metrics(
         ax.plot(n_contexts, lls_context, label="context only")
         ax.legend()
         ax.grid()
+        ax_ct += 1
+
+    if rmses is not None:
+        ax = axes[0, ax_ct]
+        ax.set_title("Root Mean Squared Errors")
+        ax.set_xlabel("n_context")
+        ax.set_xticks(n_contexts)
+        ax.set_ylabel("RMSE")
+        ax.plot(n_contexts, rmses, label="all data")
+        ax.plot(n_contexts, rmses_context, label="context only")
+        ax.legend()
+        ax.grid()
+        ax_ct += 1
 
     fig.tight_layout()
 
