@@ -326,7 +326,7 @@ def run_experiment(
 def main():
     ## config
     wandb_mode = os.getenv("WANDB_MODE", "online")
-    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
+    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(
@@ -346,7 +346,7 @@ def main():
         hidden_units=[8],
         f_act="relu",
         # training
-        n_epochs=5000 if not smoke_test else 100,
+        n_epochs=10000 if not smoke_test else 100,
         adapt_lr=0.01,
         meta_lr=0.001,
         n_adapt_steps=5,
