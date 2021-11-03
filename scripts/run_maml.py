@@ -6,7 +6,6 @@ import os
 
 import learn2learn as l2l
 import numpy as np
-import pyro
 import torch
 from torch._C import dtype
 import wandb
@@ -166,7 +165,7 @@ def run_experiment(
     wandb_run.define_metric(name="eval/*", step_metric="eval/n_context")
 
     ## seeding
-    pyro.set_rng_seed(config["seed_pyro"])
+    torch.manual_seed(config["seed"])
 
     ## create benchmarks
     # meta benchmark
@@ -332,7 +331,7 @@ def main():
     print(f"smoke_test={smoke_test}")
     config = dict(
         model="MAML",
-        seed_pyro=123,
+        seed=123,
         # benchmarks
         bm="Affine1D",
         noise_stddev=0.01,
