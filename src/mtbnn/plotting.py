@@ -177,9 +177,7 @@ def plot_predictions(
     y_meta,
     x_pred_meta,
     pred_summary_prior_meta_untrained,
-    samples_prior_meta_untrained,
     pred_summary_prior_meta_trained,
-    samples_prior_meta_trained,
     pred_summary_posterior_meta,
     x_test,
     y_test,
@@ -188,6 +186,8 @@ def plot_predictions(
     pred_summaries_posterior_test,
     n_contexts_plot,
     max_tasks,
+    samples_prior_meta_untrained = None,
+    samples_prior_meta_trained = None,
 ):
     n_meta_plots = 3 if pred_summary_posterior_meta is not None else 2
     n_test_plots = len(n_contexts_plot) if n_contexts_plot is not None else 0

@@ -315,8 +315,10 @@ def main():
         d_hidden=8,
         infer_noise_stddev=True,
         prior_type="fixed",
-        prior_init="as_pytorch_linear",
-        posterior_init="pyro_standard",
+        # allow pyro-standard variational posterior init during meta training 
+        # + setting it to prior for adaptation?
+        prior_init="standard_normal",
+        posterior_init="set_to_prior",
         # training
         n_epochs=5000 if not smoke_test else 100,
         initial_lr=0.1,
