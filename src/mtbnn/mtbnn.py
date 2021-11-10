@@ -250,6 +250,7 @@ def _marginal_log_likelihood(
         guide=guide,
         num_samples=n_samples,
         parallel=True,
+        return_sites=("obs",),
     )
     model_trace = predictive.get_vectorized_trace(x=x, y=y)
 

@@ -16,12 +16,12 @@ parameters:
       value: True
     n_tasks_meta:
       value: 16
-    n_hidden:
-      value: 2
     d_hidden:
       value: 16
     seed_pyro: 
       values: [123, 223, 323]
+    n_hidden:
+      values: [1, 2]
     prior_type:
       values: ["fixed", "factorized_normal"]
     initial_lr:
