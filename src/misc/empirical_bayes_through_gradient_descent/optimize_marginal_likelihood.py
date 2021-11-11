@@ -104,7 +104,7 @@ def predict(model, N, S):
     return samples
 
 
-def marginal_log_likelihood(model, y, S):
+def marginal_log_likelihood(model, y, S, marginalized):
     N = y.shape[0]
 
     ## obtain vectorized model trace
@@ -117,14 +117,13 @@ def marginal_log_likelihood(model, y, S):
     assert log_prob.shape == (S, N)
 
     ## compute predictive likelihood
-    if isinstance(model, LocalLVM):
+    if marginalized:
         log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # sample dim
         log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # data dim
         assert log_prob.shape == (1, 1)
         log_prob = log_prob.squeeze()
         log_prob = log_prob - N * torch.log(torch.tensor(S))
     else:
-        assert isinstance(model, GlobalLVM)
         log_prob = torch.sum(log_prob, dim=1, keepdim=True)  # data dim
         log_prob = torch.logsumexp(log_prob, dim=0, keepdim=True)  # sample dim
         assert log_prob.shape == (1, 1)
@@ -134,17 +133,15 @@ def marginal_log_likelihood(model, y, S):
     return log_prob
 
 
-def true_marginal_log_likelihood(model, y):
+def true_marginal_log_likelihood(model, y, marginalized):
     N = y.shape[0]
 
-    # TODO: unify the following
-    if isinstance(model, LocalLVM):
+    if marginalized:
         mu = model.mu_z
         sigma = torch.sqrt(model.sigma_z ** 2 + model.sigma_n ** 2)
         dist = torch.distributions.Normal(loc=mu, scale=sigma)
         log_prob = dist.log_prob(y.squeeze()).sum()
     else:
-        assert isinstance(model, GlobalLVM)
         mu = model.mu_z * torch.ones((N,))
         Sigma = model.sigma_z ** 2 * torch.ones((N, N))
         Sigma = Sigma + model.sigma_n ** 2 * torch.eye(N)
@@ -167,7 +164,7 @@ def main():
     final_lr = 1e-2
     S_marg_ll_est = 1000
     S_plot = 100
-    S_grad_est = 1000
+    S_grad_est = 1
     ## data
     mu_y = -1.0
     sigma_y = 0.5
@@ -175,9 +172,12 @@ def main():
     y = torch.randn((N, 1)) * sigma_y + mu_y
     ## model
     # type
-    # model_type = "local_lvm"
-    model_type = "global_lvm"
-    sigma_n = .49
+    model_type = "local_lvm"
+    # model_type = "global_lvm"
+    sigma_n = 0.01
+    marginalized_ll = True if model_type == "local_lvm" else False
+    # marginalized_ll = True
+    print(marginalized_ll)
 
     ### compute optimal solutions for the prior
     assert sigma_n < sigma_y
@@ -207,12 +207,14 @@ def main():
     marg_ll_sampled_init = torch.zeros(N_S)
     for i in range(N_S):
         marg_ll_sampled_init[i] = marginal_log_likelihood(
-            model=model, y=y, S=S_marg_ll_est
+            model=model, y=y, S=S_marg_ll_est, marginalized=marginalized_ll
         )
     marg_ll_samp_mean_init = marg_ll_sampled_init.mean()
     marg_ll_samp_std_init = marg_ll_sampled_init.std()
     try:
-        marg_ll_true_init = true_marginal_log_likelihood(model=model, y=y)
+        marg_ll_true_init = true_marginal_log_likelihood(
+            model=model, y=y, marginalized=marginalized_ll
+        )
     except ValueError:
         marg_ll_true_init = None
 
@@ -228,7 +230,9 @@ def main():
     lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
     for epoch in range(n_epochs):
         optim.zero_grad()
-        loss = -marginal_log_likelihood(model=model, y=y, S=S_grad_est)
+        loss = -marginal_log_likelihood(
+            model=model, y=y, S=S_grad_est, marginalized=marginalized_ll
+        )
 
         # log
         losses.append(loss.item())
@@ -257,12 +261,14 @@ def main():
     marg_ll_sampled_trained = torch.zeros(N_S)
     for i in range(N_S):
         marg_ll_sampled_trained[i] = marginal_log_likelihood(
-            model=model, y=y, S=S_marg_ll_est
+            model=model, y=y, S=S_marg_ll_est, marginalized=marginalized_ll
         )
     marg_ll_samp_mean_trained = marg_ll_sampled_trained.mean()
     marg_ll_samp_std_trained = marg_ll_sampled_trained.std()
     try:
-        marg_ll_true_trained = true_marginal_log_likelihood(model=model, y=y)
+        marg_ll_true_trained = true_marginal_log_likelihood(
+            model=model, y=y, marginalized=marginalized_ll
+        )
     except ValueError:
         marg_ll_true_trained = None
 
