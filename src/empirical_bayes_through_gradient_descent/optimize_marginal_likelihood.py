@@ -25,6 +25,9 @@ Multi-Task-BNN-c08430fc9ee44502b1dc5ce6ec1f50da#222ea3e2cc1b4afb9778c4f3b03c4668
 # - check that importance weight is zero for qmz
 # - understand difference in loss between iwmc and vi (log <-> integral) -> what is then the difference to gordon, they interchange log and integral
 
+allowed_model_types = ["local_lvm", "global_lvm"]
+allowed_guide_types = ["prior", "qmc_prior", "posterior", "trainable"]
+
 
 def check_consistency(L, N, y):
     assert not ((N is None) and (L is not None))
@@ -89,15 +92,12 @@ class LocalLVM(BaseModel):
         return obs
 
 
-class QMCPrior(PyroModule):
-    def __init__(self, mu_z_init, sigma_z_init, sigma_n):
+class QMCPriorGlobalLVM(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
 
         # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model --> TODO: split prior and likelihood!?
-
-        # likelihood
-        self.sigma_n = sigma_n
+        # shared with the model
 
         # prior
         self.mu_z = PyroParam(
@@ -120,12 +120,41 @@ class QMCPrior(PyroModule):
             self.z
 
 
+class QMCPriorLocalLVM(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+
+        # use the same attribute names as BaseModel, s.t. the guide parameters are
+        # shared with the model
+
+        # prior
+        self.mu_z = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+    @PyroSample
+    def z(self):
+        return dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            with pyro.plate("data", size=N, dim=-1):
+                self.z
+
+
 class PosteriorGlobalLVM(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init, sigma_n, y):
         super().__init__()
 
         # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model --> TODO: split prior and likelihood!?
+        # shared with the model
 
         # likelihood
         self.sigma_n = sigma_n
@@ -164,6 +193,86 @@ class PosteriorGlobalLVM(PyroModule):
             z = self.z
 
 
+class PosteriorLocalLVM(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init, sigma_n, y):
+        super().__init__()
+
+        # use the same attribute names as BaseModel, s.t. the guide parameters are
+        # shared with the model
+
+        # likelihood
+        self.sigma_n = sigma_n
+
+        # prior
+        self.mu_z = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+        # data
+        self.y = y
+
+    @PyroSample
+    def z(self):
+        N = self.y.shape[1]
+        var_post = (self.sigma_n ** 2 * self.sigma_z ** 2) / (
+            self.sigma_n ** 2 + self.sigma_z ** 2
+        )
+        mu_post = var_post * (
+            1 / self.sigma_n ** 2 * self.y + 1 / self.sigma_z ** 2 * self.mu_z
+        )
+        return dist.Normal(loc=mu_post, scale=torch.sqrt(var_post)).to_event(1)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+        assert L == self.y.shape[0]
+        assert N == self.y.shape[1]
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            with pyro.plate("data", size=N, dim=-1):
+                z = self.z
+
+
+class BaseGuide(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+
+        # prior
+        self.mu_z_guide = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z_guide = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+    @PyroSample
+    def z(self):
+        return dist.Normal(loc=self.mu_z_guide, scale=self.sigma_z_guide).to_event(1)
+
+
+class GlobalLVMGuide(BaseGuide):
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            z = self.z
+
+
+class LocalLVMGuide(BaseGuide):
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            with pyro.plate("data", size=N, dim=-1):
+                z = self.z
+
+
 def predict(model, guide, L, N, S):
     predictive = Predictive(
         model=model,
@@ -178,7 +287,7 @@ def predict(model, guide, L, N, S):
     return samples
 
 
-def log_marginal_likelihood(model, guide, y, S, marginalized):
+def log_marginal_likelihood(model, guide, y, S):
     L = y.shape[0]
     N = y.shape[1]
 
@@ -203,61 +312,93 @@ def log_marginal_likelihood(model, guide, y, S, marginalized):
     model_trace.compute_log_prob()
     guide_trace.compute_log_prob()
 
-    ## sanity checks
-    assert (model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]).all()
-    assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
-    assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
-    assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
-    assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
-    assert model_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
-    assert model_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
-    assert guide_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
-    assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
+    if isinstance(model, LocalLVM):
+        ## sanity checks
+        assert (
+            model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]
+        ).all()
+        assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
+        assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
+        assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
+        assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
+        assert model_trace.nodes["z"]["value"].shape == (S, L, N, 1)
+        assert model_trace.nodes["z"]["log_prob"].shape == (S, L, N)
+        assert guide_trace.nodes["z"]["value"].shape == (S, L, N, 1)
+        assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, N)
 
-    ## compute the log importance weights for each task and sample
-    assert not marginalized  # cf. comment below
-    log_prob_lhd = torch.sum(model_trace.nodes["obs"]["log_prob"], dim=2, keepdim=True)
-    log_prob_prior = model_trace.nodes["z"]["log_prob"]
-    log_prob_guide = guide_trace.nodes["z"]["log_prob"]
-    assert (
-        log_prob_lhd.shape == log_prob_prior.shape == log_prob_guide.shape == (S, L, 1)
-    )
-    log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
-    assert log_iw.shape == (S, L, 1)
+        ## compute the log importance weights for each task and sample
+        log_prob_lhd = model_trace.nodes["obs"]["log_prob"]
+        log_prob_prior = model_trace.nodes["z"]["log_prob"]
+        log_prob_guide = guide_trace.nodes["z"]["log_prob"]
+        assert (
+            log_prob_lhd.shape
+            == log_prob_prior.shape
+            == log_prob_guide.shape
+            == (S, L, N)
+        )
+        log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
+        assert log_iw.shape == (S, L, N)
 
-    ## compute log marginal likelihood
-    log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
-    log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
-    assert log_marg_lhd.shape == (1, 1, 1)
-    log_marg_lhd = log_marg_lhd.squeeze()
-    log_marg_lhd = log_marg_lhd - L * torch.log(torch.tensor(S))
+        ## compute log marginal likelihood
+        log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=2, keepdim=True)  # data dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
+        assert log_marg_lhd.shape == (1, 1, 1)
+        log_marg_lhd = log_marg_lhd.squeeze()
+        log_marg_lhd = log_marg_lhd - L * N * torch.log(torch.tensor(S))
 
-    # # old
-    # if marginalized:
-    #     # re-implement this for the importance-weighting case, where we have to
-    #     # sum the model_trace.nodes["obs"]["log_prob"] over dim=1 ** before **
-    #     # adding model_trace.nodes["z"]["log_prob"] - guide_trace.nodes["z"]["log_prob"]
-    #     raise NotImplementedError
-    #     log_iw = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
-    #     log_iw = torch.sum(log_iw, dim=1, keepdim=True)  # task dim
-    #     log_iw = torch.sum(log_iw, dim=2, keepdim=True)  # data dim
-    #     assert log_iw.shape == (1, 1, 1)
-    #     log_iw = log_iw.squeeze()
-    #     log_iw = log_iw - L * N * torch.log(torch.tensor(S))
+    else:
+        assert isinstance(model, GlobalLVM)
+
+        ## sanity checks
+        assert (
+            model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]
+        ).all()
+        assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
+        assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
+        assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
+        assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
+        assert model_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
+        assert model_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
+        assert guide_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
+        assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
+
+        ## compute the log importance weights for each task and sample
+        log_prob_lhd = torch.sum(
+            model_trace.nodes["obs"]["log_prob"], dim=2, keepdim=True
+        )
+        log_prob_prior = model_trace.nodes["z"]["log_prob"]
+        log_prob_guide = guide_trace.nodes["z"]["log_prob"]
+        assert (
+            log_prob_lhd.shape
+            == log_prob_prior.shape
+            == log_prob_guide.shape
+            == (S, L, 1)
+        )
+        log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
+        assert log_iw.shape == (S, L, 1)
+
+        ## compute log marginal likelihood
+        log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
+        assert log_marg_lhd.shape == (1, 1, 1)
+        log_marg_lhd = log_marg_lhd.squeeze()
+        log_marg_lhd = log_marg_lhd - L * torch.log(torch.tensor(S))
 
     return log_marg_lhd, log_iw
 
 
-def true_log_marginal_likelihood(model, y, marginalized):
+def true_log_marginal_likelihood(model, y):
     L = y.shape[0]
     N = y.shape[1]
 
-    if marginalized:
+    if isinstance(model, LocalLVM):
         mu = model.mu_z
         sigma = torch.sqrt(model.sigma_z ** 2 + model.sigma_n ** 2)
         normal = torch.distributions.Normal(loc=mu, scale=sigma)
         log_prob = normal.log_prob(y.squeeze(-1)).sum(-1)  # TODO: use event-dim
     else:
+        assert isinstance(model, GlobalLVM)
         mu = model.mu_z * torch.ones((N,))
         Sigma = model.sigma_z ** 2 * torch.ones((N, N))
         Sigma = Sigma + model.sigma_n ** 2 * torch.eye(N)
@@ -270,11 +411,13 @@ def true_log_marginal_likelihood(model, y, marginalized):
     return log_prob
 
 
-def plot_samples(samples, ax, color, label, alpha=1.0):
-    ax.scatter(
-        x=samples, y=torch.zeros(samples.shape), color=color, marker="x", alpha=alpha
+def plot_samples(samples, ax, color, linestyle, label, alpha=1.0):
+    # ax.scatter(
+    #     x=samples, y=torch.zeros(samples.shape), color=color, marker="x", alpha=alpha
+    # )
+    sns.kdeplot(
+        x=samples, ax=ax, label=label, color=color, linestyle=linestyle, alpha=alpha
     )
-    sns.kdeplot(x=samples, ax=ax, label=label, color=color, alpha=alpha)
 
 
 def generate_data(L, N, sigma_n, mu_z, sigma_z, correlated=True):
@@ -310,16 +453,18 @@ def compute_optimal_prior_parameters(model_type, sigma_n_true, y):
     L = y.shape[0]
     N = y.shape[1]
 
-    mu_z_opt = y.mean()
-    Sigma = EmpiricalCovariance().fit(y.squeeze(-1))
+    mu_emp = y.mean(dim=0)
+    Sigma_emp = EmpiricalCovariance().fit(y.squeeze(-1))
 
+    mu_z_opt = mu_emp.mean()
     if model_type == "local_lvm":
-        sigma_z_opt = np.sqrt(
-            (Sigma.covariance_[0, 0] + Sigma.covariance_[1, 1]) / 2 - sigma_n_true ** 2
-        )
+        var_opt = 1 / N * np.trace(Sigma_emp.covariance_) - sigma_n_true ** 2
+        # var_opt2 = ((y - mu_z_opt) ** 2).mean() - sigma_n_true ** 2
+        # assert np.isclose(var_opt, var_opt2.item())
+        sigma_z_opt = np.sqrt(var_opt)
     else:
         assert model_type == "global_lvm"
-        sigma_z_opt = np.sqrt(Sigma.covariance_[0, 1])  # not accurate
+        sigma_z_opt = np.sqrt(Sigma_emp.covariance_[0, 1])  # TODO: not accurate for N>2
 
     return mu_z_opt, sigma_z_opt
 
@@ -328,7 +473,7 @@ def main():
     ### settings
     pyro.set_rng_seed(123)
     optimize = True
-    n_epochs = 1000
+    n_epochs = 5000
     initial_lr = 1e-2
     final_lr = 1e-2
     S_marg_ll_est = 2 ** 10
@@ -353,54 +498,73 @@ def main():
     mu_z_init = -1.0
     sigma_z_init = 1.0
     sigma_n_model = sigma_n_true
-    marginalized_ll = True if model_type == "local_lvm" else False
     # guide
     # guide_type = "prior"
     # guide_type = "qmc_prior"  # understand scrambling
-    guide_type = "posterior"
+    # guide_type = "posterior"
+    guide_type = "trainable"
+
+    assert model_type in allowed_model_types
+    assert guide_type in allowed_guide_types
 
     ### generate model
     assert sigma_n_model == sigma_n_true  # the optimal solutions are based on this
     if model_type == "local_lvm":
-        model_cls = LocalLVM
+        model = LocalLVM(
+            mu_z_init=mu_z_init,
+            sigma_z_init=sigma_z_init,
+            sigma_n=sigma_n_model,
+        )
     elif model_type == "global_lvm":
-        model_cls = GlobalLVM
-    else:
-        raise ValueError(f"Unknown model_type '{model_type}'!")
-    model = model_cls(
-        mu_z_init=mu_z_init,
-        sigma_z_init=sigma_z_init,
-        sigma_n=sigma_n_model,
-    )
+        model = GlobalLVM(
+            mu_z_init=mu_z_init,
+            sigma_z_init=sigma_z_init,
+            sigma_n=sigma_n_model,
+        )
 
     ### generate posterior
-    assert model_type == "global_lvm"
-    posterior = PosteriorGlobalLVM(
-        mu_z_init=mu_z_init,
-        sigma_z_init=sigma_z_init,
-        sigma_n=sigma_n_model,
-        y=y,
-    )
+    if model_type == "local_lvm":
+        posterior = PosteriorLocalLVM(
+            mu_z_init=mu_z_init,
+            sigma_z_init=sigma_z_init,
+            sigma_n=sigma_n_model,
+            y=y,
+        )
+    else:
+        posterior = PosteriorGlobalLVM(
+            mu_z_init=mu_z_init,
+            sigma_z_init=sigma_z_init,
+            sigma_n=sigma_n_model,
+            y=y,
+        )
 
     ### generate guide
     if guide_type == "prior":
         guide = model
     elif guide_type == "qmc_prior":
-        if model_type == "global_lvm":
-            guide = QMCPrior(
+        if model_type == "local_lvm":
+            guide = QMCPriorLocalLVM(
                 mu_z_init=mu_z_init,
                 sigma_z_init=sigma_z_init,
-                sigma_n=sigma_n_model,
             )
         else:
-            raise NotImplementedError
+            guide = QMCPriorGlobalLVM(
+                mu_z_init=mu_z_init,
+                sigma_z_init=sigma_z_init,
+            )
     elif guide_type == "posterior":
-        if model_type == "global_lvm":
-            guide = posterior
+        guide = posterior
+    elif guide_type == "trainable":
+        if model_type == "local_lvm":
+            guide = LocalLVMGuide(
+                mu_z_init=mu_z_init,
+                sigma_z_init=sigma_z_init,
+            )
         else:
-            raise NotImplementedError
-    else:
-        raise ValueError(f"Unknown guide_type '{guide_type}'!")
+            guide = GlobalLVMGuide(
+                mu_z_init=mu_z_init,
+                sigma_z_init=sigma_z_init,
+            )
 
     ### record samples before training
     # sample z from prior
@@ -411,20 +575,22 @@ def main():
     all_samples_post_init = predict(model=model, guide=posterior, L=L, N=N, S=S_plot)
     samples_obs_post_init = all_samples_post_init["obs"]
     samples_post_init = all_samples_post_init["z"]
+    # sample z from guide
+    all_samples_guide_init = predict(model=model, guide=guide, L=L, N=N, S=S_plot)
+    samples_obs_guide_init = all_samples_guide_init["obs"]
+    samples_guide_init = all_samples_guide_init["z"]
 
     ### compute marginal likelihood before training
     N_S = 10
     marg_ll_sampled_init = torch.zeros(N_S)
     for i in range(N_S):
         marg_ll_sampled_init[i], _ = log_marginal_likelihood(
-            model=model, guide=guide, y=y, S=S_marg_ll_est, marginalized=marginalized_ll
+            model=model, guide=guide, y=y, S=S_marg_ll_est
         )
     marg_ll_samp_mean_init = marg_ll_sampled_init.mean()
     marg_ll_samp_std_init = marg_ll_sampled_init.std()
     try:
-        marg_ll_true_init = true_log_marginal_likelihood(
-            model=model, y=y, marginalized=marginalized_ll
-        )
+        marg_ll_true_init = true_log_marginal_likelihood(model=model, y=y)
     except ValueError:
         marg_ll_true_init = None
 
@@ -436,18 +602,17 @@ def main():
         log_iws = []
         mu_zs = []
         sigma_zs = []
-        optim = torch.optim.Adam(lr=initial_lr, params=model.parameters())
+        params = list(model.parameters())
+        if guide_type == "trainable":
+            params += list(guide.parameters())
+        optim = torch.optim.Adam(lr=initial_lr, params=params)
         gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
         lr_decay = gamma ** (1 / n_epochs)
         lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
         for epoch in range(n_epochs):
             optim.zero_grad()
             lml, log_iw = log_marginal_likelihood(
-                model=model,
-                guide=guide,
-                y=y,
-                S=S_grad_est,
-                marginalized=marginalized_ll,
+                model=model, guide=guide, y=y, S=S_grad_est
             )
             loss = -lml
 
@@ -459,12 +624,10 @@ def main():
 
             if epoch % 100 == 0 or epoch == n_epochs - 1:
                 # print_pyro_parameters()
-                print(
-                    f"epoch = {epoch:04d}"
-                    f" | loss = {loss.item():.4f}"
-                    f" | mu_z = {model.mu_z.item():.4f}"
-                    f" | sigma_z = {model.sigma_z.item():.4f}"
-                )
+                string = f"epoch = {epoch:04d}" f" | loss = {loss.item():+.4f}"
+                for name in pyro.get_param_store().keys():
+                    string += f" | {name} = {pyro.param(name).item():+.4f}"
+                print(string)
 
             loss.backward()
             optim.step()
@@ -481,24 +644,24 @@ def main():
         )
         samples_obs_post_trained = all_samples_post_trained["obs"]
         samples_post_trained = all_samples_post_trained["z"]
+        # sample z from guide
+        all_samples_guide_trained = predict(
+            model=model, guide=guide, L=L, N=N, S=S_plot
+        )
+        samples_obs_guide_trained = all_samples_guide_trained["obs"]
+        samples_guide_trained = all_samples_guide_trained["z"]
 
         ### compute marginal likelihood (trained)
         N_S = 10
         marg_ll_sampled_trained = torch.zeros(N_S)
         for i in range(N_S):
             marg_ll_sampled_trained[i], _ = log_marginal_likelihood(
-                model=model,
-                guide=guide,
-                y=y,
-                S=S_marg_ll_est,
-                marginalized=marginalized_ll,
+                model=model, guide=guide, y=y, S=S_marg_ll_est
             )
         marg_ll_samp_mean_trained = marg_ll_sampled_trained.mean()
         marg_ll_samp_std_trained = marg_ll_sampled_trained.std()
         try:
-            marg_ll_true_trained = true_log_marginal_likelihood(
-                model=model, y=y, marginalized=marginalized_ll
-            )
+            marg_ll_true_trained = true_log_marginal_likelihood(model=model, y=y)
         except ValueError:
             marg_ll_true_trained = None
 
@@ -548,6 +711,7 @@ def main():
             y[l, :, 0],
             ax=ax,
             color="b",
+            linestyle="-",
             label="data" if l == 0 else None,
         )
         for s in range(min(1, S_plot)):
@@ -555,6 +719,7 @@ def main():
                 samples_obs_prior_init[s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="r",
+                linestyle="--",
                 alpha=0.3,
                 label="obs prior (init)" if l == s == 0 else None,
             )
@@ -562,24 +727,43 @@ def main():
                 samples_obs_post_init[s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="g",
+                linestyle="--",
                 alpha=0.3,
                 label="obs post (init)" if l == s == 0 else None,
             )
+            plot_samples(
+                samples_obs_guide_init[s, l, :, 0].reshape(-1),
+                ax=ax,
+                color="y",
+                linestyle="--",
+                alpha=0.3,
+                label="obs guide (init)" if l == s == 0 else None,
+            )
         if optimize:
-            for s in range(3):
+            for s in range(min(1, S_plot)):
                 plot_samples(
                     samples_obs_prior_trained[s, l, :, 0].reshape(-1),
                     ax=ax,
-                    color="y",
+                    color="r",
+                    linestyle="-",
                     alpha=0.3,
                     label="obs prior (trained)" if l == s == 0 else None,
                 )
                 plot_samples(
                     samples_obs_post_trained[s, l, :, 0].reshape(-1),
                     ax=ax,
-                    color="c",
+                    color="g",
+                    linestyle="-",
                     alpha=0.3,
                     label="obs post (trained)" if l == s == 0 else None,
+                )
+                plot_samples(
+                    samples_obs_guide_trained[s, l, :, 0].reshape(-1),
+                    ax=ax,
+                    color="y",
+                    linestyle="-",
+                    alpha=0.3,
+                    label="obs guide (trained)" if l == s == 0 else None,
                 )
     ax.set_title("Data and Marginal Predictions")
     ax.set_xlabel("y_i")
