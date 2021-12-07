@@ -7,7 +7,7 @@ import torch
 from matplotlib import pyplot as plt
 from torch.autograd import grad
 from mtutils.mtutils import print_pyro_parameters
-from numpy import dtype
+from numpy import dtype, mod
 from pyro import distributions as dist
 from pyro import poutine
 from pyro.infer import Predictive
@@ -31,7 +31,7 @@ Multi-Task-BNN-c08430fc9ee44502b1dc5ce6ec1f50da#222ea3e2cc1b4afb9778c4f3b03c4668
 
 allowed_model_types = ["local_lvm", "global_lvm"]
 allowed_guide_types = ["prior", "qmc_prior", "true_posterior", "approximate_posterior"]
-allowed_log_marginal_likelihood_estimators = ["standard_elbo", "iwae_elbo"]
+allowed_log_marginal_likelihood_estimator_types = ["standard_elbo", "iwae_elbo"]
 
 
 def check_consistency(L, N, y):
@@ -95,6 +95,35 @@ class LocalLVM(BaseModel):
                 obs = pyro.sample("obs", fn=likelihood, obs=y)
 
         return obs
+
+
+class QMCPriorLocalLVM(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+
+        # use the same attribute names as BaseModel, s.t. the guide parameters are
+        # shared with the model
+
+        # prior
+        self.mu_z = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+    @PyroSample
+    def z(self):
+        return dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            with pyro.plate("data", size=N, dim=-1):
+                self.z
 
 
 class QMCPriorGlobalLVM(PyroModule):
@@ -256,7 +285,7 @@ def predict(model, guide, L, N, S):
     return samples
 
 
-def log_marginal_likelihood(model, guide, y, S, estimator_type):
+def sampled_log_marginal_likelihood(model, guide, y, S, estimator_type):
     # TODO: use RenyiELBO
     # ## validate loss
     # if estimator_type == "iwae_elbo":
@@ -268,7 +297,7 @@ def log_marginal_likelihood(model, guide, y, S, estimator_type):
     # true_elbo = elbo.loss(model=model, guide=guide, y=y)
     true_elbo = None
 
-    assert estimator_type in allowed_log_marginal_likelihood_estimators
+    assert estimator_type in allowed_log_marginal_likelihood_estimator_types
     L = y.shape[0]
     N = y.shape[1]
 
@@ -431,21 +460,7 @@ def generate_data(L, N, sigma_n, mu_z, sigma_z, correlated=True):
     return y
 
 
-# def compute_optimal_prior_parameters(model_type, sigma_n_true, mu_z_true, sigma_z_true):
-#     # TODO: check this!
-#     # TODO: compute this from the data not from the true parameters!
-
-#     mu_z_opt = mu_z_true
-#     if model_type == "local_lvm":
-#         sigma_z_opt = math.sqrt(sigma_z_true ** 2 - sigma_n_true ** 2)
-#     else:
-#         assert model_type == "global_lvm"
-#         sigma_z_opt = sigma_z_true
-
-#     return mu_z_opt, sigma_z_opt
-
-
-def compute_optimal_prior_parameters(model_type, sigma_n_true, y):
+def get_optimal_prior_parameters(model_type, sigma_n, y):
     # TODO: solution for global LVM is not accurate
     from sklearn.covariance import EmpiricalCovariance
 
@@ -457,9 +472,7 @@ def compute_optimal_prior_parameters(model_type, sigma_n_true, y):
 
     mu_z_opt = mu_emp.mean()
     if model_type == "local_lvm":
-        var_opt = 1 / N * np.trace(Sigma_emp.covariance_) - sigma_n_true ** 2
-        # var_opt2 = ((y - mu_z_opt) ** 2).mean() - sigma_n_true ** 2
-        # assert np.isclose(var_opt, var_opt2.item())
+        var_opt = 1 / N * np.trace(Sigma_emp.covariance_) - sigma_n ** 2
         sigma_z_opt = np.sqrt(var_opt)
     else:
         assert model_type == "global_lvm"
@@ -468,263 +481,242 @@ def compute_optimal_prior_parameters(model_type, sigma_n_true, y):
     return mu_z_opt, sigma_z_opt
 
 
-def main():
-    ### settings
-    pyro.set_rng_seed(123)
-    optimize = False
-    n_epochs = 1000
-    initial_lr = 1e-2
-    final_lr = 1e-2
-    S_plot = 10
-    L_plot = 3
-    S = 2 ** 0  # test this for 1, 5, 10, 100 (-> gets noisier with S)
-    ## data
-    L = 10
-    N = 50
-    mu_z_true = 1.0
-    sigma_z_true = 0.5
-    sigma_n_true = 0.01
-    y = generate_data(
-        L=L, N=N, sigma_n=sigma_n_true, mu_z=mu_z_true, sigma_z=sigma_z_true
-    )
-    ## model
-    model_type = "local_lvm"
-    # model_type = "global_lvm"
-    mu_z_opt, sigma_z_opt = compute_optimal_prior_parameters(
-        model_type=model_type, sigma_n_true=sigma_n_true, y=y
-    )
-    # mu_z_init = -1.0
-    # sigma_z_init = 1.0
-    mu_z_init = mu_z_true
-    sigma_z_init = sigma_z_true
-    sigma_n_model = sigma_n_true
-    ## guide
-    guide_type = "prior"
-    # guide_type = "qmc_prior"  # understand scrambling
-    # guide_type = "true_posterior"
-    # guide_type = "approximate_posterior"
-    ## log marginal likelihood estimator
-    lmlhd_estimator_type = "iwae_elbo"
-    # lmlhd_estimator_type = "standard_elbo"
-
-    assert model_type in allowed_model_types
-    assert guide_type in allowed_guide_types
-
-    ### generate model
-    assert sigma_n_model == sigma_n_true  # the optimal solutions are based on this
+def generate_model(model_type, mu_z_init, sigma_z_init, sigma_n):
     if model_type == "local_lvm":
         model = LocalLVM(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
-            sigma_n=sigma_n_model,
+            sigma_n=sigma_n,
         )
     elif model_type == "global_lvm":
         model = GlobalLVM(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
-            sigma_n=sigma_n_model,
+            sigma_n=sigma_n,
         )
 
-    ### generate true posterior
-    if model_type == "local_lvm":
+    return model
+
+
+def generate_true_posterior(model, mu_z_init, sigma_z_init, sigma_n, y):
+    if isinstance(model, LocalLVM):
         true_posterior = TruePosteriorLocalLVM(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
-            sigma_n=sigma_n_model,
+            sigma_n=sigma_n,
             y=y,
         )
-    else:
+    elif isinstance(model, GlobalLVM):
         true_posterior = TruePosteriorGlobalLVM(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
-            sigma_n=sigma_n_model,
+            sigma_n=sigma_n,
             y=y,
         )
 
-    ### generate guide
+    return true_posterior
+
+
+def generate_guide(model, guide_type, mu_z_init, sigma_z_init, sigma_n=None, y=None):
     if guide_type == "prior":
-        guide = model
+        if isinstance(model, LocalLVM):
+            guide = LocalLVMPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        elif isinstance(model, GlobalLVM):
+            guide = GlobalLVMPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
     elif guide_type == "qmc_prior":
-        if model_type == "local_lvm":
-            guide = QMCPriorLocalLVM(
-                mu_z_init=mu_z_init,
-                sigma_z_init=sigma_z_init,
-            )
-        else:
-            guide = QMCPriorGlobalLVM(
-                mu_z_init=mu_z_init,
-                sigma_z_init=sigma_z_init,
-            )
+        if isinstance(model, LocalLVM):
+            guide = LocalLVMQMCPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        elif isinstance(model, GlobalLVM):
+            guide = GlobalLVMQMCPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
     elif guide_type == "true_posterior":
-        guide = true_posterior
+        assert sigma_n is not None
+        assert y is not None
+        if isinstance(model, LocalLVM):
+            guide = LocalLVMTruePosterior(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init, sigma_n=sigma_n, y=y
+            )
+        elif isinstance(model, GlobalLVM):
+            guide = GlobalLVMTruePosterior(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init, sigma_n=sigma_n, y=y
+            )
     elif guide_type == "approximate_posterior":
         guide = AutoNormal(model=model)
-        # TODO: run guide once on the data to "show which sites are observed"
+        # Run guide once on the data to "show which sites are observed"
         # TODO: how to do this correctly, i.e., how to make sure guide does not
         # learn distribution over observed parameters?
         guide(y=y)
 
-    ### record samples before training
-    # sample z from prior
-    all_samples_prior_init = predict(model=model, guide=None, L=L, N=N, S=S_plot)
-    samples_obs_prior_init = all_samples_prior_init["obs"]
-    samples_prior_init = all_samples_prior_init["z"]
-    # sample z from true posterior
-    all_samples_post_init = predict(
-        model=model, guide=true_posterior, L=L, N=N, S=S_plot
-    )
-    samples_obs_post_init = all_samples_post_init["obs"]
-    samples_post_init = all_samples_post_init["z"]
-    # sample z from guide
-    all_samples_guide_init = predict(model=model, guide=guide, L=L, N=N, S=S_plot)
-    samples_obs_guide_init = all_samples_guide_init["obs"]
-    samples_guide_init = all_samples_guide_init["z"]
+    return guide
 
-    ### compute marginal likelihood before training
-    N_S = 10
-    marg_ll_sampled_init = torch.zeros(N_S)
+
+def get_samples(model, guide, true_posterior, L, N, S):
+    samples_prior = predict(model=model, guide=None, L=L, N=N, S=S)
+    samples_true_posterior = predict(model=model, guide=true_posterior, L=L, N=N, S=S)
+    samples_guide = predict(model=model, guide=guide, L=L, N=N, S=S)
+
+    return samples_prior, samples_true_posterior, samples_guide
+
+
+def get_log_marginal_likelihood(model, guide, y, S, N_S, estimator_type):
+    ## sampled solution
+    lml_sampled = torch.zeros(N_S)
     for i in range(N_S):
-        marg_ll_sampled_init[i], _, _ = log_marginal_likelihood(
+        lml_sampled[i], _, _ = sampled_log_marginal_likelihood(
             model=model,
             guide=guide,
             y=y,
             S=S,
-            estimator_type=lmlhd_estimator_type,
+            estimator_type=estimator_type,
         )
-    marg_ll_samp_mean_init = marg_ll_sampled_init.mean()
-    marg_ll_samp_std_init = marg_ll_sampled_init.std()
+    lml_sampled_mean = lml_sampled.mean()
+    lml_sampled_std = lml_sampled.std()
+
+    ## analytical solution
     try:
-        marg_ll_true_init = true_log_marginal_likelihood(model=model, y=y)
+        lml_true = true_log_marginal_likelihood(model=model, y=y)
     except ValueError:
-        marg_ll_true_init = None
+        lml_true = None
 
-    ### optimize prior
-    if optimize:
-        print(f"mu_z_opt  = {mu_z_opt:.4f}")
-        print(f"std_z_opt = {sigma_z_opt:.4f}")
-        losses = []
-        true_elbos = []
-        log_iws = []
-        mu_zs = []
-        sigma_zs = []
-        grad_mu_z_unconstraineds = []
-        grad_sigma_z_unconstraineds = []
-        params = list(model.parameters())
-        if guide_type == "approximate_posterior":
-            params += list(guide.parameters())
-        optim = torch.optim.Adam(lr=initial_lr, params=params)
-        gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
-        lr_decay = gamma ** (1 / n_epochs)
-        lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
-        for epoch in range(n_epochs):
-            optim.zero_grad()
-            lml, log_iw, true_elbo = log_marginal_likelihood(
-                model=model,
-                guide=guide,
-                y=y,
-                S=S,
-                estimator_type=lmlhd_estimator_type,
-            )
-            loss = -lml
-            loss.backward()
+    return lml_sampled_mean, lml_sampled_std, lml_true
 
-            # log
-            losses.append(loss.item())
-            true_elbos.append(true_elbo)
-            mu_zs.append(model.mu_z.item())
-            sigma_zs.append(model.sigma_z.item())
-            grad_mu_z_unconstraineds.append(model.mu_z_unconstrained.grad.item())
-            grad_sigma_z_unconstraineds.append(model.sigma_z_unconstrained.grad.item())
-            log_iws.append(log_iw.detach())
 
-            if epoch % 100 == 0 or epoch == n_epochs - 1:
-                # print_pyro_parameters()
-                string = f"epoch = {epoch:04d}" f" | loss = {loss.item():+.4f}"
-                string += f" | mu_z = {model.mu_z.item():+.4f}"
-                string += f" | mu_z = {model.sigma_z.item():+.4f}"
-                # for name in pyro.get_param_store().keys():
-                #     string += f" | {name} = {pyro.param(name)}"
-                print(string)
+def optimize_prior(
+    model, guide, y, S, lml_estimator_type, n_epochs, initial_lr, final_lr
+):
+    # prepare return values
+    losses = []
+    pyro_elbos = []
+    log_iws = []
+    mu_zs = []
+    sigma_zs = []
 
-            optim.step()
-            lr_scheduler.step()
+    # prepare optimizer
+    params = set(model.parameters() + guide.parameters())
+    optim = torch.optim.Adam(lr=initial_lr, params=params)
+    gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
+    lr_decay = gamma ** (1 / n_epochs)
+    lr_scheduler = ExponentialLR(optimizer=optim, gamma=lr_decay)
 
-        ### record samples after training
-        # sample z from prior
-        all_samples_prior_trained = predict(model=model, guide=None, L=L, N=N, S=S_plot)
-        samples_obs_prior_trained = all_samples_prior_trained["obs"]
-        samples_prior_trained = all_samples_prior_trained["z"]
-        # sample z from true posterior
-        all_samples_post_trained = predict(
-            model=model, guide=true_posterior, L=L, N=N, S=S_plot
+    # optimization loop
+    for epoch in range(n_epochs):
+        optim.zero_grad()
+        lml, log_iw, pyro_elbo = sampled_log_marginal_likelihood(
+            model=model,
+            guide=guide,
+            y=y,
+            S=S,
+            estimator_type=lml_estimator_type,
         )
-        samples_obs_post_trained = all_samples_post_trained["obs"]
-        samples_post_trained = all_samples_post_trained["z"]
-        # sample z from guide
-        all_samples_guide_trained = predict(
-            model=model, guide=guide, L=L, N=N, S=S_plot
-        )
-        samples_obs_guide_trained = all_samples_guide_trained["obs"]
-        samples_guide_trained = all_samples_guide_trained["z"]
+        loss = -lml
+        loss.backward()
 
-        ### compute marginal likelihood (trained)
-        N_S = 10
-        marg_ll_sampled_trained = torch.zeros(N_S)
-        for i in range(N_S):
-            marg_ll_sampled_trained[i], _, _ = log_marginal_likelihood(
-                model=model,
-                guide=guide,
-                y=y,
-                S=S,
-                estimator_type=lmlhd_estimator_type,
-            )
-        marg_ll_samp_mean_trained = marg_ll_sampled_trained.mean()
-        marg_ll_samp_std_trained = marg_ll_sampled_trained.std()
-        try:
-            marg_ll_true_trained = true_log_marginal_likelihood(model=model, y=y)
-        except ValueError:
-            marg_ll_true_trained = None
+        # log
+        losses.append(loss.item())
+        pyro_elbos.append(pyro_elbo)
+        mu_zs.append(model.mu_z.item())
+        sigma_zs.append(model.sigma_z.item())
+        log_iws.append(log_iw.detach())
+        if epoch % 100 == 0 or epoch == n_epochs - 1:
+            string = f"epoch = {epoch:04d}" f" | loss = {loss.item():+.4f}"
+            string += f" | mu_z = {model.mu_z.item():+.4f}"
+            string += f" | mu_z = {model.sigma_z.item():+.4f}"
+            print(string)
 
+        optim.step()
+        lr_scheduler.step()
+
+    return losses, pyro_elbos, mu_zs, sigma_zs, log_iws
+
+
+def log_results(
+    model,
+    y,
+    mu_z_true,
+    sigma_z_true,
+    sigma_n_true,
+    mu_z_init,
+    sigma_z_init,
+    mu_z_opt,
+    sigma_z_opt,
+    lml_true_init,
+    lml_sampled_init_mean,
+    lml_sampled_init_std,
+    lml_true_trained=None,
+    lml_sampled_trained_mean=None,
+    lml_sampled_trained_std=None,
+):
     ### print
     print("*" * 50)
+
+    # data
+    print(f"*" * 20)
+    print(f"mu_z_true                  = {mu_z_true:+.4f}")
+    print(f"sigma_z_true               = {sigma_z_true:+.4f}")
+    print(f"sigma_n_true               = {sigma_n_true:+.4f}")
     print(f"data mean                  = {y.mean():+.4f}")
     print(f"data std                   = {y.std():+.4f}")
-    print(f"sigma_n (model)            = {model.sigma_n:+.4f}")
-    print(f"sigma_n (true)             = {sigma_n_true:+.4f}")
+
     print("*" * 20)
-    print(f"prior mean (init)          = {mu_z_init:+.4f}")
-    print(f"prior std (init)           = {sigma_z_init:+.4f}")
+    print(f"mu_z_opt                   = {mu_z_opt:+.4f}")
+    print(f"sigma_z_opt                = {sigma_z_opt:+.4f}")
+
+    print("*" * 20)
+    print(f"mu_z_init                  = {mu_z_init:+.4f}")
+    print(f"sigma_z_init               = {sigma_z_init:+.4f}")
+    print(f"sigma_n_model              = {model.sigma_n:+.4f}")
     print(
-        f"marg ll (init, sampled)    = {marg_ll_samp_mean_init:+.4f} "
-        f"+- {marg_ll_samp_std_init:.4f}"
+        f"lml (init, sampled)       = {lml_sampled_init_mean:+.4f} "
+        f"+- {lml_sampled_init_std:.4f}"
     )
-    if marg_ll_true_init is not None:
-        print(f"marg ll (init, true)       = {marg_ll_true_init:+.4f}")
+    if lml_true_init is not None:
+        print(f"lml (init, true)           = {lml_true_init:+.4f}")
     else:
-        print(f"marg ll (init, true)       = computation error")
-    print(f"predictive mean (init)     = {samples_obs_prior_init.mean():+.4f}")
-    print(f"predictive std (init)      = {samples_obs_prior_init.std():+.4f}")
-    if optimize:
+        print(f"lml (init, true)           = computation error")
+
+    if lml_sampled_trained_mean is not None:  # if model was trained
         print("*" * 20)
-        print(f"prior mean (trained)       = {model.mu_z.item():+.4f}")
-        print(f"prior std (trained)        = {model.sigma_z.item():+.4f}")
+        print(f"mu_z_trained               = {model.mu_z.item():+.4f}")
+        print(f"sigma_z_trained            = {model.sigma_z.item():+.4f}")
         print(
-            f"marg ll (trained, sampled) = {marg_ll_samp_mean_trained:+.4f} "
-            f"+- {marg_ll_samp_std_trained:.4f}"
+            f"lml     (trained, sampled) = {lml_sampled_trained_mean:+.4f} "
+            f"+- {lml_sampled_trained_std:.4f}"
         )
-        if marg_ll_true_trained is not None:
-            print(f"marg ll (trained, true)    = {marg_ll_true_trained:+.4f}")
+        if lml_true_trained is not None:
+            print(f"lml (trained, true)       = {lml_true_trained:+.4f}")
         else:
-            print(f"marg ll (trained, true)    = computation error")
-        print(f"predictive mean (trained)  = {samples_obs_prior_trained.mean():+.4f}")
-        print(f"predictive std (trained)   = {samples_obs_prior_trained.std():+.4f}")
-        print("*" * 20)
-        print(f"prior mean (opt)           = {mu_z_opt:+.4f}")
-        print(f"prior std (opt)            = {sigma_z_opt:+.4f}")
+            print(f"lml (trained, true)       = computation error")
+    else:
+        assert lml_sampled_trained_std is None
+        assert lml_true_trained is None
+
     print("*" * 50)
 
-    ### plot prediction
-    fig, axes = plt.subplots(nrows=1, ncols=5, squeeze=False, figsize=(15, 8))
+
+def plot_summary(
+    y,
+    samples_prior_init,
+    samples_true_posterior_init,
+    samples_guide_init,
+    samples_prior_trained=None,
+    samples_true_posterior_trained=None,
+    samples_guide_trained=None,
+    losses=None,
+    pyro_elbos=None,  # elbos computed by Pyro's implementation
+    mu_zs=None,
+    sigma_zs=None,
+    mu_z_opt=None,
+    sigma_z_opt=None,
+):
+    L = y.shape[0]
+    S = samples_prior_init["obs"].shape[0]
+
+    ## prepare plot
+    optimization_performed = samples_prior_trained is not None
+    nrows = 2 if optimization_performed else 1
+    ncols = 3 if optimization_performed else 2
+    fig, axes = plt.subplots(nrows=2, ncols=3, squeeze=False, figsize=(15, 8))
+
+    ## initial data and predictions (distributions)
     ax = axes[0, 0]
     for l in range(min(3, L)):
         plot_kde(
@@ -734,28 +726,28 @@ def main():
             linestyle="-",
             label="data" if l == 0 else None,
         )
-        for s in range(S_plot):
+        for s in range(S):
             plot_kde(
-                samples_obs_prior_init[s, l, :, 0].reshape(-1),
+                samples_prior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="r",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs prior (init)" if l == s == 0 else None,
             )
             plot_kde(
-                samples_obs_post_init[s, l, :, 0].reshape(-1),
+                samples_true_posterior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="g",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs true posterior (init)" if l == s == 0 else None,
             )
             plot_kde(
-                samples_obs_guide_init[s, l, :, 0].reshape(-1),
+                samples_guide_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="y",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs guide (init)" if l == s == 0 else None,
             )
@@ -765,8 +757,9 @@ def main():
     ax.grid()
     ax.legend()
 
+    ## initial data and predictions (functions)
     ax = axes[0, 1]
-    for l in range(L_plot):
+    for l in range(L):
         plot_functions(
             y[l, :, 0],
             ax=ax,
@@ -774,28 +767,28 @@ def main():
             linestyle="-",
             label="data" if l == 0 else None,
         )
-        for s in range(S_plot):
+        for s in range(S):
             plot_functions(
-                samples_obs_prior_init[s, l, :, 0].reshape(-1),
+                samples_prior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="r",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs prior (init)" if l == s == 0 else None,
             )
             plot_functions(
-                samples_obs_post_init[s, l, :, 0].reshape(-1),
+                samples_true_posterior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="g",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs true posterior (init)" if l == s == 0 else None,
             )
             plot_functions(
-                samples_obs_guide_init[s, l, :, 0].reshape(-1),
+                samples_guide_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
                 color="y",
-                linestyle="--",
+                linestyle="-",
                 alpha=0.3,
                 label="obs guide (init)" if l == s == 0 else None,
             )
@@ -805,10 +798,11 @@ def main():
     ax.grid()
     ax.legend()
 
-    if optimize:
-        ax = axes[0, 1]
+    if optimization_performed:  # only if model was trained
+        ## trained data and predictions (distributions)
+        ax = axes[1, 0]
         ax.sharex(axes[0, 0])
-        for l in range(min(3, L)):
+        for l in range(L):
             plot_kde(
                 y[l, :, 0],
                 ax=ax,
@@ -816,9 +810,9 @@ def main():
                 linestyle="-",
                 label="data" if l == 0 else None,
             )
-            for s in range(S_plot):
+            for s in range(S):
                 plot_kde(
-                    samples_obs_prior_trained[s, l, :, 0].reshape(-1),
+                    samples_prior_trained["obs"][s, l, :, 0].reshape(-1),
                     ax=ax,
                     color="r",
                     linestyle="-",
@@ -826,7 +820,7 @@ def main():
                     label="obs prior (trained)" if l == s == 0 else None,
                 )
                 plot_kde(
-                    samples_obs_post_trained[s, l, :, 0].reshape(-1),
+                    samples_true_posterior_trained["obs"][s, l, :, 0].reshape(-1),
                     ax=ax,
                     color="g",
                     linestyle="-",
@@ -834,7 +828,7 @@ def main():
                     label="obs true posterior (trained)" if l == s == 0 else None,
                 )
                 plot_kde(
-                    samples_obs_guide_trained[s, l, :, 0].reshape(-1),
+                    samples_guide_trained["obs"][s, l, :, 0].reshape(-1),
                     ax=ax,
                     color="y",
                     linestyle="-",
@@ -847,17 +841,63 @@ def main():
         ax.grid()
         ax.legend()
 
+        ## trained data and predictions (functions)
+        ax = axes[1, 1]
+        ax.sharex(axes[0, 1])
+        ax.sharey(axes[0, 1])
+        for l in range(L):
+            plot_functions(
+                y[l, :, 0],
+                ax=ax,
+                color="b",
+                linestyle="-",
+                label="data" if l == 0 else None,
+            )
+            for s in range(S):
+                plot_functions(
+                    samples_prior_trained["obs"][s, l, :, 0].reshape(-1),
+                    ax=ax,
+                    color="r",
+                    linestyle="-",
+                    alpha=0.3,
+                    label="obs prior (trained)" if l == s == 0 else None,
+                )
+                plot_functions(
+                    samples_true_posterior_trained["obs"][s, l, :, 0].reshape(-1),
+                    ax=ax,
+                    color="g",
+                    linestyle="-",
+                    alpha=0.3,
+                    label="obs true posterior (trained)" if l == s == 0 else None,
+                )
+                plot_functions(
+                    samples_guide_trained["obs"][s, l, :, 0].reshape(-1),
+                    ax=ax,
+                    color="y",
+                    linestyle="-",
+                    alpha=0.3,
+                    label="obs guide (trained)" if l == s == 0 else None,
+                )
+        ax.set_title("Data and Predictions (trained)")
+        ax.set_xlabel("n")
+        ax.set_ylabel("y_n")
+        ax.grid()
+        ax.legend()
+
+        ## Learning curve
         ax = axes[0, 2]
         ax.plot(np.arange(len(losses)), losses, label="loss")
-        if true_elbos[0] is not None:
-            ax.plot(np.arange(len(true_elbos)), true_elbos, label="true elbo")
+        if pyro_elbos[0] is not None:
+            ax.plot(np.arange(len(pyro_elbos)), pyro_elbos, label="Pyro elbo")
         ax.set_title("Learning curve")
         ax.set_xlabel("epoch")
         ax.set_ylabel("loss")
         ax.grid()
         ax.legend()
 
-        ax = axes[0, 3]
+        ## Learning trajectory
+        ax = axes[1, 2]
+        n_epochs = len(mu_zs)
         ax.scatter(x=mu_zs, y=sigma_zs, c=np.arange(n_epochs) + 1)
         ax.set_title("Learning trajectory")
         ax.axvline(mu_z_opt, ls="--")
@@ -867,41 +907,220 @@ def main():
         ax.grid()
         plt.tight_layout()
 
-        log_iw = torch.stack(log_iws, dim=0)
-        log_iw = log_iw.reshape(n_epochs, -1)
-        fig, axes = plt.subplots(
-            nrows=5, ncols=5, figsize=(15, 8), squeeze=False, sharex=True, sharey=True
-        )
-        fig.suptitle("Distribution of Log Importance Weights")
-        for i, epoch in enumerate(range(0, n_epochs, n_epochs // 25)):
-            ax = axes[i // 5, i % 5]
-            sns.histplot(data=log_iw[epoch], ax=ax, bins=25)
-            ax.set_title(f"ep = {epoch:d}")
-        plt.tight_layout()
-
-        fig, axes = plt.subplots(
-            nrows=2, ncols=1, figsize=(15, 8), squeeze=False, sharex=True, sharey=True
-        )
-        fig.suptitle("Gradients of mu_z == mu_z_unconstrained")
-        ax = axes[0, 0]
-        ax.plot(np.arange(len(grad_mu_z_unconstraineds)), grad_mu_z_unconstraineds)
-        ax.set_ylabel(f"grad_mu_z")
-        ax.set_xlabel(f"epoch")
-        ax.grid()
-
-        fig.suptitle("Gradients of sigma_z_unconstrained")
-        ax = axes[1, 0]
-        ax.plot(
-            np.arange(len(grad_sigma_z_unconstraineds)), grad_sigma_z_unconstraineds
-        )
-        ax.set_ylabel(f"grad_sigma_z_unconstrained")
-        ax.set_xlabel(f"epoch")
-        ax.grid()
-
-        plt.tight_layout()
-
     plt.tight_layout()
+
+
+def plot_log_importance_weight_histograms(log_iws):
+    n_epochs = len(log_iws)
+    log_iw = torch.stack(log_iws, dim=0)
+    log_iw = log_iw.reshape(n_epochs, -1)
+    fig, axes = plt.subplots(
+        nrows=5, ncols=5, figsize=(15, 8), squeeze=False, sharex=True, sharey=True
+    )
+    fig.suptitle("Distribution of Log Importance Weights")
+    for i, epoch in enumerate(range(0, n_epochs, n_epochs // 25)):
+        ax = axes[i // 5, i % 5]
+        sns.histplot(data=log_iw[epoch], ax=ax, bins=25)
+        ax.set_title(f"ep = {epoch:d}")
+    plt.tight_layout()
+
+
+def run_experiment(config, wandb_run):
+    ### check some settings
+    assert config["model_type"] in allowed_model_types
+    assert config["guide_type"] in allowed_guide_types
+    assert (
+        config["log_marginal_likelihood_estimator_type"]
+        in allowed_log_marginal_likelihood_estimator_types
+    )
+    # the optimal solutions depend on this:
+    assert config["sigma_n_model"] == config["sigma_n_true"]
+
+    ### seed torch, random, np.random
+    pyro.set_rng_seed(config["rng_seed"])
+
+    ### data
+    y = generate_data(
+        L=config["L"],
+        N=config["N"],
+        sigma_n=config["sigma_n_true"],
+        mu_z=config["mu_z_true"],
+        sigma_z=config["sigma_z_true"],
+    )
+
+    ### optimal prior parameters
+    mu_z_opt, sigma_z_opt = get_optimal_prior_parameters(
+        model_type=config["model_type"],
+        sigma_n=config["sigma_n_true"],
+        y=y,
+    )
+
+    ### model
+    model = generate_model(
+        model_type=config["model_type"],
+        mu_z_init=config["mu_z_init"],
+        sigma_z_init=config["sigma_z_init"],
+        sigma_n=config["sigma_n_model"],
+    )
+
+    ### true posterior
+    true_posterior = generate_true_posterior(
+        model_type=config["model_type"],
+        mu_z_init=config["mu_z_init"],
+        sigma_z_init=config["sigma_z_init"],
+        sigma_n=config["sigma_n_model"],
+        y=y,
+    )
+
+    ### guide
+    guide = generate_guide(
+        model=model,
+        guide_type=config["guide_type"],
+        mu_z_init=config["mu_z_init"],
+        sigma_z_init=config["sigma_z_init"],
+        # only required if guide_type == "true_posterior":
+        sigma_n=config["sigma_n_model"],
+        y=y,
+    )
+
+    ### record samples before training
+    samples_prior_init, samples_true_posterior_init, samples_guide_init = get_samples(
+        model=model,
+        guide=guide,
+        L=config["L_plot"],
+        S=config["S_plot"],
+    )
+
+    ### compute log marginal likelihood before training
+    (
+        lml_sampled_init_mean,
+        lml_sampled_init_std,
+        lml_true_init,
+    ) = get_log_marginal_likelihood(
+        model=model,
+        guide=guide,
+        y=y,
+        S=config["S"],
+        N_S=config["N_S"],
+        estimator_type=config["lml_estimator_type"],
+    )
+
+    ### optimize prior
+    if config["optimize"]:
+        print(f"mu_z_opt  = {mu_z_opt:.4f}")
+        print(f"std_z_opt = {sigma_z_opt:.4f}")
+        losses, pyro_elbos, mu_zs, sigma_zs, log_iws = optimize_prior(
+            model=model,
+            guide=guide,
+            y=y,
+            S=config["S"],
+            lml_estimator_type=config["lml_estimator_type"],
+            n_epochs=config["n_epochs"],
+            initial_lr=config["initial_lr"],
+            final_lr=config["final_lr"],
+        )
+
+        ### record samples after training
+        (
+            samples_prior_trained,
+            samples_true_posterior_trained,
+            samples_guide_trained,
+        ) = get_samples(
+            model=model,
+            guide=guide,
+            L=config["L_plot"],
+            S=config["S_plot"],
+        )
+
+        ### compute marginal likelihood after training
+        (
+            lml_sampled_trained_mean,
+            lml_sampled_trained_std,
+            lml_true_trained,
+        ) = get_log_marginal_likelihood(
+            model=model,
+            guide=guide,
+            y=y,
+            S=config["S"],
+            N_S=config["N_S"],
+            estimator_type=config["lml_estimator_type"],
+        )
+
+    ## log results
+    log_results(
+        model=model,
+        y=y,
+        mu_z_true=config["mu_z_true"],
+        sigma_z_true=config["sigma_z_true"],
+        mu_z_init=config["mu_z_init"],
+        sigma_z_init=config["sigma_z_init"],
+        mu_z_opt=config["mu_z_opt"],
+        sigma_z_opt=config["sigma_z_opt"],
+        lml_true_init=lml_true_init,
+        lml_sampled_init_mean=lml_sampled_init_mean,
+        lml_sampled_init_std=lml_sampled_init_std,
+        lml_true_trained=lml_true_trained if config["optimize"] else None,
+        lml_sampled_trained_mean=lml_sampled_trained_mean
+        if config["optimize"]
+        else None,
+        lml_sampled_trained_std=lml_sampled_trained_std if config["optimize"] else None,
+    )
+
+    ## plot results
+    plot_summary(
+        y=y,
+        samples_prior_init=samples_prior_init,
+        samples_true_posterior_init=samples_true_posterior_init,
+        samples_guide_init=samples_guide_init,
+        samples_prior_trained=samples_prior_trained if config["optimize"] else None,
+        samples_true_posterior_trained=samples_true_posterior_trained
+        if config["optimize"]
+        else None,
+        samples_guide_trained=samples_guide_trained if config["optimize"] else None,
+        losses=losses if config["optimize"] else None,
+        pyro_elbos=pyro_elbos if config["optimize"] else None,
+        mu_zs=mu_zs if config["optimize"] else None,
+        sigma_zs=sigma_zs if config["sigma_zs"] else None,
+        mu_z_opt=mu_z_opt if config["optimize"] else None,
+        sigma_z_opt=sigma_z_opt if config["optimize"] else None,
+    )
+    if config["optimize"]:
+        plot_log_importance_weight_histograms(log_iws=log_iws)
     plt.show()
+
+
+def main():
+    ### settings
+    pyro.set_rng_seed(123)
+    optimize = True
+    n_epochs = 1000
+    initial_lr = 1e-2
+    final_lr = 1e-2
+    S_plot = 10
+    S = 2 ** 0  # number of samples for log marg likelihood / gradient estimation
+    N_S = 25  # number of sample sets for log marg likelihood estimation
+    ## data
+    L = 10
+    N = 50
+    mu_z_true = 1.0
+    sigma_z_true = 0.5
+    sigma_n_true = 0.01
+    ## model
+    # model_type = "local_lvm"
+    model_type = "global_lvm"
+    mu_z_init = -1.0
+    sigma_z_init = 1.0
+    # mu_z_init = mu_z_true
+    # sigma_z_init = sigma_z_true
+    sigma_n_model = sigma_n_true
+    ## guide
+    guide_type = "prior"
+    # guide_type = "qmc_prior"  # understand scrambling
+    # guide_type = "true_posterior"
+    # guide_type = "approximate_posterior"
+    ## log marginal likelihood estimator
+    lmlhd_estimator_type = "iwae_elbo"
+    # lmlhd_estimator_type = "standard_elbo"
 
 
 if __name__ == "__main__":
