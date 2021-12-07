@@ -1,22 +1,25 @@
 import math
+import os
 
+import pprint
 import numpy as np
 import pyro
 import seaborn as sns
 import torch
+import wandb
 from matplotlib import pyplot as plt
-from torch.autograd import grad
 from mtutils.mtutils import print_pyro_parameters
 from numpy import dtype, mod
 from pyro import distributions as dist
 from pyro import poutine
 from pyro.infer import Predictive
-from pyro.nn import PyroModule, PyroParam, PyroSample
-from torch.distributions import constraints
-from torch.optim.lr_scheduler import ExponentialLR
+from pyro.infer.autoguide import AutoNormal
 from pyro.infer.renyi_elbo import RenyiELBO
 from pyro.infer.trace_elbo import Trace_ELBO
-from pyro.infer.autoguide import AutoNormal
+from pyro.nn import PyroModule, PyroParam, PyroSample
+from torch.autograd import grad
+from torch.distributions import constraints
+from torch.optim.lr_scheduler import ExponentialLR
 
 from empirical_bayes_through_gradient_descent.qmc_sampling import QMCNormal
 
@@ -49,217 +52,157 @@ def check_consistency(L, N, y):
     return L, N
 
 
-class BaseModel(PyroModule):
+class GaussianPrior(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+
+        self.mu_z = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+    def forward(self):
+        prior = dist.Normal(loc=self.mu_z, scale=self.sigma_z).to_event(1)
+        z = pyro.sample("z", fn=prior)
+        return z
+
+
+class QMCGaussianPrior(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+
+        self.mu_z = PyroParam(
+            init_value=torch.tensor([mu_z_init]),
+            constraint=constraints.real,
+        )
+        self.sigma_z = PyroParam(
+            init_value=torch.tensor([sigma_z_init]),
+            constraint=constraints.positive,
+        )
+
+    def forward(self):
+        prior = dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+        z = pyro.sample("z", fn=prior)
+        return z
+
+
+class GaussianLikelihood(PyroModule):
+    def __init__(self, sigma_n):
+        super().__init__()
+
+        self.sigma_n = sigma_n
+
+    def forward(self, z, y=None):
+        likelihood = dist.Normal(loc=z, scale=self.sigma_n).to_event(1)
+        obs = pyro.sample("obs", fn=likelihood, obs=y)
+        return obs
+
+
+class LocalLVM(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init, sigma_n):
         super().__init__()
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
 
-        # likelihood
-        self.sigma_n = sigma_n
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-    @PyroSample
-    def z(self):
-        return dist.Normal(loc=self.mu_z, scale=self.sigma_z).to_event(1)
-
-
-class GlobalLVM(BaseModel):
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
 
         with pyro.plate("tasks", size=L, dim=-2):
-            z = self.z
             with pyro.plate("data", size=N, dim=-1):
-                likelihood = dist.Normal(loc=z, scale=self.sigma_n).to_event(1)
-                obs = pyro.sample("obs", fn=likelihood, obs=y)
+                z = self.prior()
+                obs = self.likelihood(z=z, y=y)
 
         return obs
 
 
-class LocalLVM(BaseModel):
+class GlobalLVM(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init, sigma_n):
+        super().__init__()
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
+
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
 
         with pyro.plate("tasks", size=L, dim=-2):
+            z = self.prior()
             with pyro.plate("data", size=N, dim=-1):
-                z = self.z
-                likelihood = dist.Normal(loc=z, scale=self.sigma_n).to_event(1)
-                obs = pyro.sample("obs", fn=likelihood, obs=y)
+                obs = self.likelihood(z=z, y=y)
 
         return obs
 
 
-class QMCPriorLocalLVM(PyroModule):
+class LocalLVMQMCGaussianPriorGuide(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
-
-        # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-    @PyroSample
-    def z(self):
-        return dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
 
         with pyro.plate("tasks", size=L, dim=-2):
             with pyro.plate("data", size=N, dim=-1):
-                self.z
+                self.prior()
 
 
-class QMCPriorGlobalLVM(PyroModule):
+class GlobalLVMQMCGaussianPriorGuide(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
-
-        # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-    @PyroSample
-    def z(self):
-        return dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
 
         with pyro.plate("tasks", size=L, dim=-2):
-            self.z
+            self.prior()
 
 
-class QMCPriorLocalLVM(PyroModule):
+class LocalLVMGaussianPriorGuide(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
-
-        # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-    @PyroSample
-    def z(self):
-        return dist.Independent(QMCNormal(loc=self.mu_z, scale=self.sigma_z), 1)
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
 
         with pyro.plate("tasks", size=L, dim=-2):
             with pyro.plate("data", size=N, dim=-1):
-                self.z
+                self.prior()
 
 
-class TruePosteriorGlobalLVM(PyroModule):
-    def __init__(self, mu_z_init, sigma_z_init, sigma_n, y):
+class GlobalLVMGaussianPriorGuide(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
-
-        # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model
-
-        # likelihood
-        self.sigma_n = sigma_n
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-        # data
-        self.y = y
-
-    @PyroSample
-    def z(self):
-        N = self.y.shape[1]
-        var_post = (self.sigma_n ** 2 * self.sigma_z ** 2) / (
-            self.sigma_n ** 2 + N * self.sigma_z ** 2
-        )
-        mu_post = var_post * (
-            1 / self.sigma_n ** 2 * torch.sum(self.y, dim=1, keepdims=True)
-            + 1 / self.sigma_z ** 2 * self.mu_z
-        )
-        return dist.Normal(loc=mu_post, scale=torch.sqrt(var_post)).to_event(1)
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
-        assert L == self.y.shape[0]
-        assert N == self.y.shape[1]
 
         with pyro.plate("tasks", size=L, dim=-2):
-            z = self.z
+            self.prior()
 
 
-class TruePosteriorLocalLVM(PyroModule):
+class LocalLVMTruePosterior(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init, sigma_n, y):
         super().__init__()
-
-        # use the same attribute names as BaseModel, s.t. the guide parameters are
-        # shared with the model
-
-        # likelihood
-        self.sigma_n = sigma_n
-
-        # prior
-        self.mu_z = PyroParam(
-            init_value=torch.tensor([mu_z_init]),
-            constraint=constraints.real,
-        )
-        self.sigma_z = PyroParam(
-            init_value=torch.tensor([sigma_z_init]),
-            constraint=constraints.positive,
-        )
-
-        # data
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
         self.y = y
 
-    @PyroSample
-    def z(self):
+        # compute posterior parameters
         N = self.y.shape[1]
-        var_post = (self.sigma_n ** 2 * self.sigma_z ** 2) / (
-            self.sigma_n ** 2 + self.sigma_z ** 2
+        var_post = (self.likelihood.sigma_n ** 2 * self.prior.sigma_z ** 2) / (
+            self.likelihood.sigma_n ** 2 + self.prior.sigma_z ** 2
         )
-        mu_post = var_post * (
-            1 / self.sigma_n ** 2 * self.y + 1 / self.sigma_z ** 2 * self.mu_z
+        self.mu_post = var_post * (
+            1 / self.likelihood.sigma_n ** 2 * self.y
+            + 1 / self.prior.sigma_z ** 2 * self.prior.mu_z
         )
-        return dist.Normal(loc=mu_post, scale=torch.sqrt(var_post)).to_event(1)
+        self.std_post = torch.sqrt(var_post)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
@@ -268,7 +211,39 @@ class TruePosteriorLocalLVM(PyroModule):
 
         with pyro.plate("tasks", size=L, dim=-2):
             with pyro.plate("data", size=N, dim=-1):
-                z = self.z
+                posterior = dist.Normal(
+                    loc=self.mu_post,
+                    scale=self.std_post,
+                ).to_event(1)
+                z = pyro.sample("z", fn=posterior)
+
+
+class GlobalLVMTruePosterior(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init, sigma_n, y):
+        super().__init__()
+        self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+        self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
+        self.y = y
+
+        # compute posterior parameters
+        N = self.y.shape[1]
+        var_post = (self.likelihood.sigma_n ** 2 * self.prior.sigma_z ** 2) / (
+            self.likelihood.sigma_n ** 2 + N * self.prior.sigma_z ** 2
+        )
+        self.mu_post = var_post * (
+            1 / self.likelihood.sigma_n ** 2 * torch.sum(self.y, dim=1, keepdims=True)
+            + 1 / self.prior.sigma_z ** 2 * self.prior.mu_z
+        )
+        self.std_post = torch.sqrt(var_post)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+        assert L == self.y.shape[0]
+        assert N == self.y.shape[1]
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            posterior = dist.Normal(loc=self.mu_post, scale=self.std_post).to_event(1)
+            z = pyro.sample("z", fn=posterior)
 
 
 def predict(model, guide, L, N, S):
@@ -287,14 +262,14 @@ def predict(model, guide, L, N, S):
 
 def sampled_log_marginal_likelihood(model, guide, y, S, estimator_type):
     # TODO: use RenyiELBO
-    # ## validate loss
-    # if estimator_type == "iwae_elbo":
-    #     elbo = RenyiELBO(alpha=0.0, vectorize_particles=True, num_particles=S)
-    # elif estimator_type == "standard_elbo":
-    #     elbo = Trace_ELBO(vectorize_particles=True, num_particles=S)
-    # else:
-    #     raise NotImplementedError
-    # true_elbo = elbo.loss(model=model, guide=guide, y=y)
+    ## validate loss
+    if estimator_type == "iwae_elbo":
+        elbo = RenyiELBO(alpha=0.0, vectorize_particles=True, num_particles=S)
+    elif estimator_type == "standard_elbo":
+        elbo = Trace_ELBO(vectorize_particles=True, num_particles=S)
+    else:
+        raise NotImplementedError
+    true_elbo = elbo.loss(model=model, guide=guide, y=y)
     true_elbo = None
 
     assert estimator_type in allowed_log_marginal_likelihood_estimator_types
@@ -412,15 +387,15 @@ def true_log_marginal_likelihood(model, y):
     N = y.shape[1]
 
     if isinstance(model, LocalLVM):
-        mu = model.mu_z
-        sigma = torch.sqrt(model.sigma_z ** 2 + model.sigma_n ** 2)
+        mu = model.prior.mu_z
+        sigma = torch.sqrt(model.prior.sigma_z ** 2 + model.likelihood.sigma_n ** 2)
         normal = torch.distributions.Normal(loc=mu, scale=sigma)
         log_prob = normal.log_prob(y.squeeze(-1)).sum(-1)  # TODO: use event-dim
     else:
         assert isinstance(model, GlobalLVM)
-        mu = model.mu_z * torch.ones((N,))
-        Sigma = model.sigma_z ** 2 * torch.ones((N, N))
-        Sigma = Sigma + model.sigma_n ** 2 * torch.eye(N)
+        mu = model.prior.mu_z * torch.ones((N,))
+        Sigma = model.prior.sigma_z ** 2 * torch.ones((N, N))
+        Sigma = Sigma + model.likelihood.sigma_n ** 2 * torch.eye(N)
         normal = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
         log_prob = normal.log_prob(y.squeeze(-1))
 
@@ -500,14 +475,14 @@ def generate_model(model_type, mu_z_init, sigma_z_init, sigma_n):
 
 def generate_true_posterior(model, mu_z_init, sigma_z_init, sigma_n, y):
     if isinstance(model, LocalLVM):
-        true_posterior = TruePosteriorLocalLVM(
+        true_posterior = LocalLVMTruePosterior(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
             sigma_n=sigma_n,
             y=y,
         )
     elif isinstance(model, GlobalLVM):
-        true_posterior = TruePosteriorGlobalLVM(
+        true_posterior = GlobalLVMTruePosterior(
             mu_z_init=mu_z_init,
             sigma_z_init=sigma_z_init,
             sigma_n=sigma_n,
@@ -520,14 +495,22 @@ def generate_true_posterior(model, mu_z_init, sigma_z_init, sigma_n, y):
 def generate_guide(model, guide_type, mu_z_init, sigma_z_init, sigma_n=None, y=None):
     if guide_type == "prior":
         if isinstance(model, LocalLVM):
-            guide = LocalLVMPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+            guide = LocalLVMGaussianPriorGuide(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init
+            )
         elif isinstance(model, GlobalLVM):
-            guide = GlobalLVMPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+            guide = GlobalLVMGaussianPriorGuide(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init
+            )
     elif guide_type == "qmc_prior":
         if isinstance(model, LocalLVM):
-            guide = LocalLVMQMCPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+            guide = LocalLVMQMCGaussianPriorGuide(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init
+            )
         elif isinstance(model, GlobalLVM):
-            guide = GlobalLVMQMCPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+            guide = GlobalLVMQMCGaussianPriorGuide(
+                mu_z_init=mu_z_init, sigma_z_init=sigma_z_init
+            )
     elif guide_type == "true_posterior":
         assert sigma_n is not None
         assert y is not None
@@ -581,7 +564,7 @@ def get_log_marginal_likelihood(model, guide, y, S, N_S, estimator_type):
 
 
 def optimize_prior(
-    model, guide, y, S, lml_estimator_type, n_epochs, initial_lr, final_lr
+    model, guide, y, S, lml_estimator_type, n_epochs, initial_lr, final_lr, wandb_run
 ):
     # prepare return values
     losses = []
@@ -591,7 +574,7 @@ def optimize_prior(
     sigma_zs = []
 
     # prepare optimizer
-    params = set(model.parameters() + guide.parameters())
+    params = set.union(set(model.parameters()), set(guide.parameters()))
     optim = torch.optim.Adam(lr=initial_lr, params=params)
     gamma = final_lr / initial_lr  # final learning rate will be gamma * initial_lr
     lr_decay = gamma ** (1 / n_epochs)
@@ -613,13 +596,14 @@ def optimize_prior(
         # log
         losses.append(loss.item())
         pyro_elbos.append(pyro_elbo)
-        mu_zs.append(model.mu_z.item())
-        sigma_zs.append(model.sigma_z.item())
+        mu_zs.append(model.prior.mu_z.item())
+        sigma_zs.append(model.prior.sigma_z.item())
         log_iws.append(log_iw.detach())
+        wandb_run.log({"epoch": epoch, "loss": loss})
         if epoch % 100 == 0 or epoch == n_epochs - 1:
             string = f"epoch = {epoch:04d}" f" | loss = {loss.item():+.4f}"
-            string += f" | mu_z = {model.mu_z.item():+.4f}"
-            string += f" | mu_z = {model.sigma_z.item():+.4f}"
+            string += f" | mu_z = {model.prior.mu_z.item():+.4f}"
+            string += f" | sigma_z = {model.prior.sigma_z.item():+.4f}"
             print(string)
 
         optim.step()
@@ -628,71 +612,64 @@ def optimize_prior(
     return losses, pyro_elbos, mu_zs, sigma_zs, log_iws
 
 
-def log_results(
-    model,
-    y,
+def get_results(
+    y_mean,
+    y_std,
     mu_z_true,
     sigma_z_true,
     sigma_n_true,
     mu_z_init,
     sigma_z_init,
+    sigma_n_model,
     mu_z_opt,
     sigma_z_opt,
     lml_true_init,
     lml_sampled_init_mean,
     lml_sampled_init_std,
+    mu_z_trained=None,
+    sigma_z_trained=None,
     lml_true_trained=None,
     lml_sampled_trained_mean=None,
     lml_sampled_trained_std=None,
 ):
-    ### print
-    print("*" * 50)
-
-    # data
-    print(f"*" * 20)
-    print(f"mu_z_true                  = {mu_z_true:+.4f}")
-    print(f"sigma_z_true               = {sigma_z_true:+.4f}")
-    print(f"sigma_n_true               = {sigma_n_true:+.4f}")
-    print(f"data mean                  = {y.mean():+.4f}")
-    print(f"data std                   = {y.std():+.4f}")
-
-    print("*" * 20)
-    print(f"mu_z_opt                   = {mu_z_opt:+.4f}")
-    print(f"sigma_z_opt                = {sigma_z_opt:+.4f}")
-
-    print("*" * 20)
-    print(f"mu_z_init                  = {mu_z_init:+.4f}")
-    print(f"sigma_z_init               = {sigma_z_init:+.4f}")
-    print(f"sigma_n_model              = {model.sigma_n:+.4f}")
-    print(
-        f"lml (init, sampled)       = {lml_sampled_init_mean:+.4f} "
-        f"+- {lml_sampled_init_std:.4f}"
+    lml_sampled_init_rel_error = (
+        (lml_sampled_init_mean - lml_true_init) / lml_true_init
+        if lml_true_init is not None
+        else None
     )
-    if lml_true_init is not None:
-        print(f"lml (init, true)           = {lml_true_init:+.4f}")
-    else:
-        print(f"lml (init, true)           = computation error")
-
-    if lml_sampled_trained_mean is not None:  # if model was trained
-        print("*" * 20)
-        print(f"mu_z_trained               = {model.mu_z.item():+.4f}")
-        print(f"sigma_z_trained            = {model.sigma_z.item():+.4f}")
-        print(
-            f"lml     (trained, sampled) = {lml_sampled_trained_mean:+.4f} "
-            f"+- {lml_sampled_trained_std:.4f}"
-        )
-        if lml_true_trained is not None:
-            print(f"lml (trained, true)       = {lml_true_trained:+.4f}")
-        else:
-            print(f"lml (trained, true)       = computation error")
-    else:
-        assert lml_sampled_trained_std is None
-        assert lml_true_trained is None
-
-    print("*" * 50)
+    lml_sampled_trained_rel_error = (
+        (lml_sampled_trained_mean - lml_true_trained) / lml_true_trained
+        if lml_true_trained is not None
+        else None
+    )
+    results = {
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "mu_z_true": mu_z_true,
+        "sigma_z_true": sigma_z_true,
+        "sigma_n_true": sigma_n_true,
+        "mu_z_init": mu_z_init,
+        "sigma_z_init": sigma_z_init,
+        "mu_z_trained": mu_z_trained,
+        "sigma_z_trained": sigma_z_trained,
+        "sigma_n_model": sigma_n_model,
+        "mu_z_opt": mu_z_opt,
+        "sigma_z_opt": sigma_z_opt,
+        "lml_true_init": lml_true_init,
+        "lml_sampled_init_mean": lml_sampled_init_mean,
+        "lml_sampled_init_std": lml_sampled_init_std,
+        "lml_sampled_init_rel_error": lml_sampled_init_rel_error,
+        "lml_true_trained": lml_true_trained,
+        "lml_sampled_trained_mean": lml_sampled_trained_mean,
+        "lml_sampled_trained_std": lml_sampled_trained_std,
+        "lml_sampled_trained_rel_error": lml_sampled_trained_rel_error,
+    }
+    return results
 
 
 def plot_summary(
+    L_plot,
+    S_plot,
     y,
     samples_prior_init,
     samples_true_posterior_init,
@@ -707,8 +684,6 @@ def plot_summary(
     mu_z_opt=None,
     sigma_z_opt=None,
 ):
-    L = y.shape[0]
-    S = samples_prior_init["obs"].shape[0]
 
     ## prepare plot
     optimization_performed = samples_prior_trained is not None
@@ -718,7 +693,7 @@ def plot_summary(
 
     ## initial data and predictions (distributions)
     ax = axes[0, 0]
-    for l in range(min(3, L)):
+    for l in range(L_plot):
         plot_kde(
             y[l, :, 0],
             ax=ax,
@@ -726,7 +701,7 @@ def plot_summary(
             linestyle="-",
             label="data" if l == 0 else None,
         )
-        for s in range(S):
+        for s in range(S_plot):
             plot_kde(
                 samples_prior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
@@ -759,7 +734,7 @@ def plot_summary(
 
     ## initial data and predictions (functions)
     ax = axes[0, 1]
-    for l in range(L):
+    for l in range(L_plot):
         plot_functions(
             y[l, :, 0],
             ax=ax,
@@ -767,7 +742,7 @@ def plot_summary(
             linestyle="-",
             label="data" if l == 0 else None,
         )
-        for s in range(S):
+        for s in range(S_plot):
             plot_functions(
                 samples_prior_init["obs"][s, l, :, 0].reshape(-1),
                 ax=ax,
@@ -802,7 +777,7 @@ def plot_summary(
         ## trained data and predictions (distributions)
         ax = axes[1, 0]
         ax.sharex(axes[0, 0])
-        for l in range(L):
+        for l in range(L_plot):
             plot_kde(
                 y[l, :, 0],
                 ax=ax,
@@ -810,7 +785,7 @@ def plot_summary(
                 linestyle="-",
                 label="data" if l == 0 else None,
             )
-            for s in range(S):
+            for s in range(S_plot):
                 plot_kde(
                     samples_prior_trained["obs"][s, l, :, 0].reshape(-1),
                     ax=ax,
@@ -845,7 +820,7 @@ def plot_summary(
         ax = axes[1, 1]
         ax.sharex(axes[0, 1])
         ax.sharey(axes[0, 1])
-        for l in range(L):
+        for l in range(L_plot):
             plot_functions(
                 y[l, :, 0],
                 ax=ax,
@@ -853,7 +828,7 @@ def plot_summary(
                 linestyle="-",
                 label="data" if l == 0 else None,
             )
-            for s in range(S):
+            for s in range(S_plot):
                 plot_functions(
                     samples_prior_trained["obs"][s, l, :, 0].reshape(-1),
                     ax=ax,
@@ -909,6 +884,8 @@ def plot_summary(
 
     plt.tight_layout()
 
+    return fig
+
 
 def plot_log_importance_weight_histograms(log_iws):
     n_epochs = len(log_iws)
@@ -924,14 +901,15 @@ def plot_log_importance_weight_histograms(log_iws):
         ax.set_title(f"ep = {epoch:d}")
     plt.tight_layout()
 
+    return fig
+
 
 def run_experiment(config, wandb_run):
     ### check some settings
     assert config["model_type"] in allowed_model_types
     assert config["guide_type"] in allowed_guide_types
     assert (
-        config["log_marginal_likelihood_estimator_type"]
-        in allowed_log_marginal_likelihood_estimator_types
+        config["lml_estimator_type"] in allowed_log_marginal_likelihood_estimator_types
     )
     # the optimal solutions depend on this:
     assert config["sigma_n_model"] == config["sigma_n_true"]
@@ -965,7 +943,7 @@ def run_experiment(config, wandb_run):
 
     ### true posterior
     true_posterior = generate_true_posterior(
-        model_type=config["model_type"],
+        model=model,
         mu_z_init=config["mu_z_init"],
         sigma_z_init=config["sigma_z_init"],
         sigma_n=config["sigma_n_model"],
@@ -986,9 +964,11 @@ def run_experiment(config, wandb_run):
     ### record samples before training
     samples_prior_init, samples_true_posterior_init, samples_guide_init = get_samples(
         model=model,
+        true_posterior=true_posterior,
         guide=guide,
-        L=config["L_plot"],
-        S=config["S_plot"],
+        L=config["L"],
+        S=config["S"],
+        N=config["N"],
     )
 
     ### compute log marginal likelihood before training
@@ -1018,6 +998,7 @@ def run_experiment(config, wandb_run):
             n_epochs=config["n_epochs"],
             initial_lr=config["initial_lr"],
             final_lr=config["final_lr"],
+            wandb_run=wandb_run,
         )
 
         ### record samples after training
@@ -1027,9 +1008,11 @@ def run_experiment(config, wandb_run):
             samples_guide_trained,
         ) = get_samples(
             model=model,
+            true_posterior=true_posterior,
             guide=guide,
-            L=config["L_plot"],
-            S=config["S_plot"],
+            L=config["L"],
+            S=config["S"],
+            N=config["N"],
         )
 
         ### compute marginal likelihood after training
@@ -1047,27 +1030,37 @@ def run_experiment(config, wandb_run):
         )
 
     ## log results
-    log_results(
-        model=model,
-        y=y,
+    results = get_results(
+        y_mean=y.mean().item(),
+        y_std=y.std().item(),
         mu_z_true=config["mu_z_true"],
         sigma_z_true=config["sigma_z_true"],
+        sigma_n_true=config["sigma_n_true"],
         mu_z_init=config["mu_z_init"],
         sigma_z_init=config["sigma_z_init"],
-        mu_z_opt=config["mu_z_opt"],
-        sigma_z_opt=config["sigma_z_opt"],
-        lml_true_init=lml_true_init,
-        lml_sampled_init_mean=lml_sampled_init_mean,
-        lml_sampled_init_std=lml_sampled_init_std,
-        lml_true_trained=lml_true_trained if config["optimize"] else None,
-        lml_sampled_trained_mean=lml_sampled_trained_mean
+        sigma_n_model=config["sigma_n_model"],
+        mu_z_opt=mu_z_opt.item(),
+        sigma_z_opt=sigma_z_opt.item(),
+        lml_true_init=lml_true_init.item(),
+        lml_sampled_init_mean=lml_sampled_init_mean.item(),
+        lml_sampled_init_std=lml_sampled_init_std.item(),
+        mu_z_trained=model.prior.mu_z.item() if config["optimize"] else None,
+        sigma_z_trained=model.prior.sigma_z.item() if config["optimize"] else None,
+        lml_true_trained=lml_true_trained.item() if config["optimize"] else None,
+        lml_sampled_trained_mean=lml_sampled_trained_mean.item()
         if config["optimize"]
         else None,
-        lml_sampled_trained_std=lml_sampled_trained_std if config["optimize"] else None,
+        lml_sampled_trained_std=lml_sampled_trained_std.item()
+        if config["optimize"]
+        else None,
     )
+    wandb_run.log(results)
+    pprint.pprint(results)
 
     ## plot results
-    plot_summary(
+    fig = plot_summary(
+        L_plot=min(config["L_plot"], config["L"]),
+        S_plot=min(config["S_plot"], config["S"]),
         y=y,
         samples_prior_init=samples_prior_init,
         samples_true_posterior_init=samples_true_posterior_init,
@@ -1080,47 +1073,65 @@ def run_experiment(config, wandb_run):
         losses=losses if config["optimize"] else None,
         pyro_elbos=pyro_elbos if config["optimize"] else None,
         mu_zs=mu_zs if config["optimize"] else None,
-        sigma_zs=sigma_zs if config["sigma_zs"] else None,
+        sigma_zs=sigma_zs if config["optimize"] else None,
         mu_z_opt=mu_z_opt if config["optimize"] else None,
         sigma_z_opt=sigma_z_opt if config["optimize"] else None,
     )
+    wandb_run.log({"summary_plot": wandb.Image(fig)})
     if config["optimize"]:
-        plot_log_importance_weight_histograms(log_iws=log_iws)
-    plt.show()
+        fig = plot_log_importance_weight_histograms(log_iws=log_iws)
+        wandb_run.log({"log_importance_weights_plot": wandb.Image(fig)})
+
+    if wandb_run.mode == "disabled":
+        plt.show()
 
 
 def main():
-    ### settings
-    pyro.set_rng_seed(123)
-    optimize = True
-    n_epochs = 1000
-    initial_lr = 1e-2
-    final_lr = 1e-2
-    S_plot = 10
-    S = 2 ** 0  # number of samples for log marg likelihood / gradient estimation
-    N_S = 25  # number of sample sets for log marg likelihood estimation
-    ## data
-    L = 10
-    N = 50
-    mu_z_true = 1.0
-    sigma_z_true = 0.5
+    ## define config
+    wandb_mode = os.getenv("WANDB_MODE", "online")
+    print(f"wandb_mode={wandb_mode}")
+
     sigma_n_true = 0.01
-    ## model
-    # model_type = "local_lvm"
-    model_type = "global_lvm"
-    mu_z_init = -1.0
-    sigma_z_init = 1.0
-    # mu_z_init = mu_z_true
-    # sigma_z_init = sigma_z_true
-    sigma_n_model = sigma_n_true
-    ## guide
-    guide_type = "prior"
-    # guide_type = "qmc_prior"  # understand scrambling
-    # guide_type = "true_posterior"
-    # guide_type = "approximate_posterior"
-    ## log marginal likelihood estimator
-    lmlhd_estimator_type = "iwae_elbo"
-    # lmlhd_estimator_type = "standard_elbo"
+    config = {
+        "rng_seed": 123,
+        ## data
+        "L": 25,
+        "N": 25,
+        "mu_z_true": 1.0,
+        "sigma_z_true": 0.5,
+        "sigma_n_true": sigma_n_true,
+        ## model
+        "model_type": "local_lvm",
+        # "model_type": "global_lvm",
+        "mu_z_init": -1.0,
+        "sigma_z_init": 1.0,
+        "sigma_n_model": sigma_n_true,
+        ## guide
+        # "guide_type": "prior",
+        # "guide_type": "qmc_prior",  # understand scrambling
+        # "guide_type": "true_posterior",
+        "guide_type": "approximate_posterior",
+        ## log marginal likelihood estimation
+        # "lml_estimator_type": "iwae_elbo",
+        "lml_estimator_type": "standard_elbo",
+        "S": 2 ** 4,  # number of samples for log marg likelihood / gradient estimation
+        "N_S": 25,  # number of sample sets for log marg likelihood estimation
+        ## optimization
+        "optimize": True,
+        "n_epochs": 100,
+        "initial_lr": 1e-2,
+        "final_lr": 1e-2,
+        ## plotting
+        "S_plot": 10,
+        "L_plot": 10,
+    }
+
+    if wandb_mode != "disabled":
+        wandb.login()
+
+    with wandb.init(project="LVM", mode=wandb_mode, config=config) as wandb_run:
+        config = wandb_run.config
+        run_experiment(config=config, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":
