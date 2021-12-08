@@ -1,0 +1,19 @@
+
+name: model_guide_estimator_types_S 
+description: |
+  Compare global vs. local LVM.
+  Compare different S.
+  Compare different log marginal likelihood estimators/guides.
+project: LVM
+program: optimize_marginal_likelihood.py
+method: grid 
+parameters: 
+    model_type:
+      values: ["local_lvm", "global_lvm"]
+    guide_type:
+      values: ["prior", "qmc_prior", "true_posterior", "approximate_posterior"]
+    lml_estimator_type:
+      values: ["iwae_elbo", "standard_elbo"]
+    S:
+      values: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    

@@ -193,16 +193,26 @@ class LocalLVMTruePosterior(PyroModule):
         self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
         self.y = y
 
-        # compute posterior parameters
+    # note that the posterior parameters have to be implemented as methods s.t. the
+    # computation graph is re-created each time
+    # https://www.notion.so/Random-Stuff-b3fed31141f243d4986a210bd7f011e0#e73a3c2c009e48f78fb53da0891a7c4a
+    @property
+    def var(self):
+        # compute posterior variance
         N = self.y.shape[1]
         var_post = (self.likelihood.sigma_n ** 2 * self.prior.sigma_z ** 2) / (
             self.likelihood.sigma_n ** 2 + self.prior.sigma_z ** 2
         )
-        self.mu_post = var_post * (
+        return var_post
+
+    @property
+    def mean(self):
+        # compute posterior mean
+        mu_post = self.var * (
             1 / self.likelihood.sigma_n ** 2 * self.y
             + 1 / self.prior.sigma_z ** 2 * self.prior.mu_z
         )
-        self.std_post = torch.sqrt(var_post)
+        return mu_post
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
@@ -212,8 +222,8 @@ class LocalLVMTruePosterior(PyroModule):
         with pyro.plate("tasks", size=L, dim=-2):
             with pyro.plate("data", size=N, dim=-1):
                 posterior = dist.Normal(
-                    loc=self.mu_post,
-                    scale=self.std_post,
+                    loc=self.mean,
+                    scale=torch.sqrt(self.var),
                 ).to_event(1)
                 z = pyro.sample("z", fn=posterior)
 
@@ -225,16 +235,26 @@ class GlobalLVMTruePosterior(PyroModule):
         self.likelihood = GaussianLikelihood(sigma_n=sigma_n)
         self.y = y
 
-        # compute posterior parameters
+    # note that the posterior parameters have to be implemented as methods s.t. the
+    # computation graph is re-created each time
+    # https://www.notion.so/Random-Stuff-b3fed31141f243d4986a210bd7f011e0#e73a3c2c009e48f78fb53da0891a7c4a
+    @property
+    def var(self):
+        # compute posterior variance
         N = self.y.shape[1]
         var_post = (self.likelihood.sigma_n ** 2 * self.prior.sigma_z ** 2) / (
             self.likelihood.sigma_n ** 2 + N * self.prior.sigma_z ** 2
         )
-        self.mu_post = var_post * (
+        return var_post
+
+    @property
+    def mean(self):
+        # compute posterior mean
+        mu_post = self.var * (
             1 / self.likelihood.sigma_n ** 2 * torch.sum(self.y, dim=1, keepdims=True)
             + 1 / self.prior.sigma_z ** 2 * self.prior.mu_z
         )
-        self.std_post = torch.sqrt(var_post)
+        return mu_post
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
@@ -242,7 +262,9 @@ class GlobalLVMTruePosterior(PyroModule):
         assert N == self.y.shape[1]
 
         with pyro.plate("tasks", size=L, dim=-2):
-            posterior = dist.Normal(loc=self.mu_post, scale=self.std_post).to_event(1)
+            posterior = dist.Normal(loc=self.mean, scale=torch.sqrt(self.var)).to_event(
+                1
+            )
             z = pyro.sample("z", fn=posterior)
 
 
@@ -601,7 +623,8 @@ def optimize_prior(
         log_iws.append(log_iw.detach())
         wandb_run.log({"epoch": epoch, "loss": loss})
         if epoch % 100 == 0 or epoch == n_epochs - 1:
-            string = f"epoch = {epoch:04d}" f" | loss = {loss.item():+.4f}"
+            string = f"epoch = {epoch:04d}"
+            string += f" | loss = {loss.item():+.4f}"
             string += f" | mu_z = {model.prior.mu_z.item():+.4f}"
             string += f" | sigma_z = {model.prior.sigma_z.item():+.4f}"
             print(string)
@@ -637,9 +660,21 @@ def get_results(
         if lml_true_init is not None
         else None
     )
+    lml_sampled_init_std_to_mean = lml_sampled_init_std / abs(lml_sampled_init_mean)
     lml_sampled_trained_rel_error = (
         (lml_sampled_trained_mean - lml_true_trained) / lml_true_trained
         if lml_true_trained is not None
+        else None
+    )
+    lml_sampled_trained_std_to_mean = lml_sampled_trained_std / abs(
+        lml_sampled_trained_mean
+    )
+    mu_z_trained_rel_error = (
+        (mu_z_trained - mu_z_opt) / mu_z_opt if mu_z_trained is not None else None
+    )
+    sigma_z_trained_rel_error = (
+        (sigma_z_trained - sigma_z_opt) / sigma_z_opt
+        if sigma_z_trained is not None
         else None
     )
     results = {
@@ -651,7 +686,9 @@ def get_results(
         "mu_z_init": mu_z_init,
         "sigma_z_init": sigma_z_init,
         "mu_z_trained": mu_z_trained,
+        "mu_z_trained_rel_error": mu_z_trained_rel_error,
         "sigma_z_trained": sigma_z_trained,
+        "sigma_z_trained_rel_error": sigma_z_trained_rel_error,
         "sigma_n_model": sigma_n_model,
         "mu_z_opt": mu_z_opt,
         "sigma_z_opt": sigma_z_opt,
@@ -659,10 +696,12 @@ def get_results(
         "lml_sampled_init_mean": lml_sampled_init_mean,
         "lml_sampled_init_std": lml_sampled_init_std,
         "lml_sampled_init_rel_error": lml_sampled_init_rel_error,
+        "lml_sampled_init_std_to_mean": lml_sampled_init_std_to_mean,
         "lml_true_trained": lml_true_trained,
         "lml_sampled_trained_mean": lml_sampled_trained_mean,
         "lml_sampled_trained_std": lml_sampled_trained_std,
         "lml_sampled_trained_rel_error": lml_sampled_trained_rel_error,
+        "lml_sampled_trained_std_to_mean": lml_sampled_trained_std_to_mean,
     }
     return results
 
@@ -1087,8 +1126,10 @@ def run_experiment(config, wandb_run):
 
 
 def main():
+    # TODO: true posterior does not work anymore
+
     ## define config
-    wandb_mode = os.getenv("WANDB_MODE", "online")
+    wandb_mode = os.getenv("WANDB_MODE", "disabled")
     print(f"wandb_mode={wandb_mode}")
 
     sigma_n_true = 0.01
@@ -1109,16 +1150,16 @@ def main():
         ## guide
         # "guide_type": "prior",
         # "guide_type": "qmc_prior",  # understand scrambling
-        # "guide_type": "true_posterior",
-        "guide_type": "approximate_posterior",
+        "guide_type": "true_posterior",
+        # "guide_type": "approximate_posterior",
         ## log marginal likelihood estimation
         # "lml_estimator_type": "iwae_elbo",
         "lml_estimator_type": "standard_elbo",
-        "S": 2 ** 4,  # number of samples for log marg likelihood / gradient estimation
+        "S": 2 ** 2,  # number of samples for log marg likelihood / gradient estimation
         "N_S": 25,  # number of sample sets for log marg likelihood estimation
         ## optimization
         "optimize": True,
-        "n_epochs": 100,
+        "n_epochs": 1000,
         "initial_lr": 1e-2,
         "final_lr": 1e-2,
         ## plotting
