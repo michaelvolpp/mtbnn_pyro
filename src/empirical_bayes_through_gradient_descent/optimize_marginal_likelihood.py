@@ -1203,7 +1203,7 @@ def run_experiment(config, wandb_run):
 
 def main():
     ## define config
-    wandb_mode = os.getenv("WANDB_MODE", "disabled")
+    wandb_mode = os.getenv("WANDB_MODE", "online")
     print(f"wandb_mode={wandb_mode}")
 
     sigma_n_true = 0.01
