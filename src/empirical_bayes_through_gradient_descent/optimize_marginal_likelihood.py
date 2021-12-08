@@ -8,6 +8,7 @@ import seaborn as sns
 import torch
 import wandb
 from matplotlib import pyplot as plt
+from misc.local_reparametrization import compute_log_iw
 from mtutils.mtutils import print_pyro_parameters
 from numpy import dtype, mod
 from pyro import distributions as dist
@@ -34,7 +35,12 @@ Multi-Task-BNN-c08430fc9ee44502b1dc5ce6ec1f50da#222ea3e2cc1b4afb9778c4f3b03c4668
 
 allowed_model_types = ["local_lvm", "global_lvm"]
 allowed_guide_types = ["prior", "qmc_prior", "true_posterior", "approximate_posterior"]
-allowed_log_marginal_likelihood_estimator_types = ["standard_elbo", "iwae_elbo"]
+allowed_log_marginal_likelihood_estimator_types = [
+    "standard_elbo",
+    "standard_elbo_local_reparametrization",
+    "iwae_elbo",
+    "iwae_elbo_local_reparametrization",
+]
 
 
 def check_consistency(L, N, y):
@@ -136,31 +142,6 @@ class GlobalLVM(PyroModule):
         return obs
 
 
-class LocalLVMQMCGaussianPriorGuide(PyroModule):
-    def __init__(self, mu_z_init, sigma_z_init):
-        super().__init__()
-        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
-
-    def forward(self, L=None, N=None, y=None):
-        L, N = check_consistency(L=L, N=N, y=y)
-
-        with pyro.plate("tasks", size=L, dim=-2):
-            with pyro.plate("data", size=N, dim=-1):
-                self.prior()
-
-
-class GlobalLVMQMCGaussianPriorGuide(PyroModule):
-    def __init__(self, mu_z_init, sigma_z_init):
-        super().__init__()
-        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
-
-    def forward(self, L=None, N=None, y=None):
-        L, N = check_consistency(L=L, N=N, y=y)
-
-        with pyro.plate("tasks", size=L, dim=-2):
-            self.prior()
-
-
 class LocalLVMGaussianPriorGuide(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
@@ -178,6 +159,31 @@ class GlobalLVMGaussianPriorGuide(PyroModule):
     def __init__(self, mu_z_init, sigma_z_init):
         super().__init__()
         self.prior = GaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            self.prior()
+
+
+class LocalLVMQMCGaussianPriorGuide(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
+
+    def forward(self, L=None, N=None, y=None):
+        L, N = check_consistency(L=L, N=N, y=y)
+
+        with pyro.plate("tasks", size=L, dim=-2):
+            with pyro.plate("data", size=N, dim=-1):
+                self.prior()
+
+
+class GlobalLVMQMCGaussianPriorGuide(PyroModule):
+    def __init__(self, mu_z_init, sigma_z_init):
+        super().__init__()
+        self.prior = QMCGaussianPrior(mu_z_init=mu_z_init, sigma_z_init=sigma_z_init)
 
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
@@ -259,7 +265,7 @@ class GlobalLVMTruePosterior(PyroModule):
     def forward(self, L=None, N=None, y=None):
         L, N = check_consistency(L=L, N=N, y=y)
         assert L == self.y.shape[0]
-        assert N == self.y.shape[1]
+        # assert N == self.y.shape[1]   does not have to be the case for local reparam.
 
         with pyro.plate("tasks", size=L, dim=-2):
             posterior = dist.Normal(loc=self.mean, scale=torch.sqrt(self.var)).to_event(
@@ -282,126 +288,182 @@ def predict(model, guide, L, N, S):
     return samples
 
 
-def sampled_log_marginal_likelihood(model, guide, y, S, estimator_type):
-    # TODO: use RenyiELBO
-    ## validate loss
-    if estimator_type == "iwae_elbo":
-        elbo = RenyiELBO(alpha=0.0, vectorize_particles=True, num_particles=S)
-    elif estimator_type == "standard_elbo":
-        elbo = Trace_ELBO(vectorize_particles=True, num_particles=S)
-    else:
-        raise NotImplementedError
-    true_elbo = elbo.loss(model=model, guide=guide, y=y)
-    true_elbo = None
-
-    assert estimator_type in allowed_log_marginal_likelihood_estimator_types
+def get_traces(model, guide, S, y):
     L = y.shape[0]
     N = y.shape[1]
 
     ## sample hidden variables from guide
     # cf. https://docs.pyro.ai/en/1.7.0/_modules/pyro/infer/importance.html#Importance
-    # vectorize guide
-    vectorized_guide = pyro.plate("batch", size=S, dim=-3)(guide)
-    # hide observed samples
-    #  -> this is only necessary if we set guide = model, as then the guide also samples
-    #     observed sites
-    guide_trace = poutine.block(vectorized_guide, hide_types=["observe"])
-    # trace guide
-    guide_trace = poutine.trace(guide_trace)
-    guide_trace = guide_trace.get_trace(y=y)
+    # add batch plate
+    guide = pyro.plate("batch", size=S, dim=-3)(guide)
+    model = pyro.plate("batch", size=S, dim=-3)(model)
 
-    ## replay model with hidden samples from guide
-    vectorized_model = pyro.plate("batch", size=S, dim=-3)(model)
-    replayed_model = poutine.replay(vectorized_model, trace=guide_trace)
-    model_trace = poutine.trace(replayed_model).get_trace(y=y)
+    ## sample latents from guide (hide observed samples)
+    guide_trace = poutine.trace(guide).get_trace(L=L, N=N)
+    assert "obs" not in guide_trace.nodes.keys()
+
+    ## replay model with latent samples from guide
+    model = poutine.replay(model, trace=guide_trace)
+    model_trace = poutine.trace(model).get_trace(y=y)
 
     ## compute log_probs
     model_trace.compute_log_prob()
     guide_trace.compute_log_prob()
 
-    if isinstance(model, LocalLVM):
-        ## sanity checks
-        assert (
-            model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]
-        ).all()
-        assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
-        assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
-        assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
-        assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
-        assert model_trace.nodes["z"]["value"].shape == (S, L, N, 1)
-        assert model_trace.nodes["z"]["log_prob"].shape == (S, L, N)
-        assert guide_trace.nodes["z"]["value"].shape == (S, L, N, 1)
-        assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, N)
+    return model_trace, guide_trace
 
-        ## compute the log importance weights for each task and sample
-        log_prob_lhd = model_trace.nodes["obs"]["log_prob"]
-        log_prob_prior = model_trace.nodes["z"]["log_prob"]
-        log_prob_guide = guide_trace.nodes["z"]["log_prob"]
-        assert (
-            log_prob_lhd.shape
-            == log_prob_prior.shape
-            == log_prob_guide.shape
-            == (S, L, N)
+
+def compute_pyro_elbo(model, guide, estimator_type, S, y):
+    ## validate loss
+    if estimator_type == "iwae_elbo":
+        pyro_elbo = RenyiELBO(
+            alpha=0.0, vectorize_particles=True, num_particles=S
+        ).loss(model=model, guide=guide, y=y)
+    elif estimator_type == "standard_elbo":
+        pyro_elbo = Trace_ELBO(vectorize_particles=True, num_particles=S).loss(
+            model=model, guide=guide, y=y
         )
-        log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
-        assert log_iw.shape == (S, L, N)
+    else:
+        pyro_elbo = None  # TODO: implement local reparametrization w/ pyro elbo
 
-        ## compute log marginal likelihood
-        if estimator_type == "iwae_elbo":
-            log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
-            log_marg_lhd = torch.sum(log_marg_lhd, dim=2, keepdim=True)  # data dim
-            log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
-            assert log_marg_lhd.shape == (1, 1, 1)
-            log_marg_lhd = log_marg_lhd.squeeze()
-            log_marg_lhd = log_marg_lhd - L * N * torch.log(torch.tensor(S))
-        elif estimator_type == "standard_elbo":
-            log_marg_lhd = torch.sum(log_iw) / S
-        else:
-            raise NotImplementedError
+    return pyro_elbo
+
+
+def sampled_log_marginal_likelihood_local_lvm(model, guide, estimator_type, S, y):
+    assert estimator_type in [
+        "iwae_elbo",
+        "standard_elbo",
+    ], "Local reparametrization not compatible with local LVM!"
+
+    model_trace, guide_trace = get_traces(model=model, guide=guide, S=S, y=y)
+    L, N = y.shape[0], y.shape[1]
+
+    ## sanity checks
+    assert (model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]).all()
+    assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
+    assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
+    assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
+    assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
+    assert model_trace.nodes["z"]["value"].shape == (S, L, N, 1)
+    assert model_trace.nodes["z"]["log_prob"].shape == (S, L, N)
+    assert guide_trace.nodes["z"]["value"].shape == (S, L, N, 1)
+    assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, N)
+
+    ## compute the log importance weights for each task and sample
+    log_prob_lhd = model_trace.nodes["obs"]["log_prob"]
+    log_prob_prior = model_trace.nodes["z"]["log_prob"]
+    log_prob_guide = guide_trace.nodes["z"]["log_prob"]
+    assert (
+        log_prob_lhd.shape == log_prob_prior.shape == log_prob_guide.shape == (S, L, N)
+    )
+    log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
+    assert log_iw.shape == (S, L, N)
+
+    ## compute log marginal likelihood
+    if estimator_type == "iwae_elbo":
+        log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=2, keepdim=True)  # data dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
+        assert log_marg_lhd.shape == (1, 1, 1)
+        log_marg_lhd = log_marg_lhd.squeeze()
+        log_marg_lhd = log_marg_lhd - L * N * torch.log(torch.tensor(S))
+    elif estimator_type == "standard_elbo":
+        log_marg_lhd = torch.sum(log_iw) / S
+    else:
+        raise NotImplementedError
+
+    return log_marg_lhd, log_iw
+
+
+def compute_log_iw_global_lvm(model, guide, S, y):
+    model_trace, guide_trace = get_traces(model=model, guide=guide, S=S, y=y)
+    L, N = y.shape[0], y.shape[1]
+
+    ## sanity checks
+    assert (model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]).all()
+    assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
+    assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
+    assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
+    assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
+    assert model_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
+    assert model_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
+    assert guide_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
+    assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
+
+    ## compute the log importance weights for each task and sample
+    log_prob_lhd = torch.sum(model_trace.nodes["obs"]["log_prob"], dim=2, keepdim=True)
+    log_prob_prior = model_trace.nodes["z"]["log_prob"]
+    log_prob_guide = guide_trace.nodes["z"]["log_prob"]
+    assert (
+        log_prob_lhd.shape == log_prob_prior.shape == log_prob_guide.shape == (S, L, 1)
+    )
+    log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
+
+    return log_iw
+
+
+def sampled_log_marginal_likelihood_global_lvm(model, guide, estimator_type, S, y):
+    do_local_reparametrization = (
+        estimator_type == "iwae_elbo_local_reparametrization"
+        or estimator_type == "standard_elbo_local_reparametrization"
+    )
+    L, N = y.shape[0], y.shape[1]
+
+    if not do_local_reparametrization:
+        log_iw = compute_log_iw(model=model, guide=guide, S=S, y=y)
+    else:
+        log_iw = torch.zeros(S, L, N)
+        # TODO: vectorize this
+        # compute singleton log_iws with different latent samples
+        for n in range(N):
+            log_iw[:, :, n : n + 1] = compute_log_iw(
+                model=model, guide=guide, S=S, y=y[:, n : n + 1, :]
+            )
+        # sum up all singleton log_iws
+        log_iw = torch.sum(log_iw, dim=2, keepdim=True)
+
+    assert log_iw.shape == (S, L, 1)
+
+    ## compute log marginal likelihood
+    if (
+        estimator_type == "iwae_elbo"
+        or estimator_type == "iwae_elbo_local_reparametrization"
+    ):
+        log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
+        log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
+        assert log_marg_lhd.shape == (1, 1, 1)
+        log_marg_lhd = log_marg_lhd.squeeze()
+        log_marg_lhd = log_marg_lhd - L * torch.log(torch.tensor(S))
+    elif (
+        estimator_type == "standard_elbo"
+        or estimator_type == "standard_elbo_local_reparametrization"
+    ):
+        log_marg_lhd = torch.sum(log_iw) / S
+    else:
+        raise NotImplementedError
+
+    return log_marg_lhd, log_iw
+
+
+def sampled_log_marginal_likelihood(model, guide, y, S, estimator_type):
+    assert estimator_type in allowed_log_marginal_likelihood_estimator_types
+
+    # TODO: always use standard Pyro methods
+    pyro_elbo = compute_pyro_elbo(
+        model=model, guide=guide, estimator_type=estimator_type, S=S, y=y
+    )
+
+    if isinstance(model, LocalLVM):
+        log_marg_lhd, log_iw = sampled_log_marginal_likelihood_local_lvm(
+            model=model, guide=guide, estimator_type=estimator_type, S=S, y=y
+        )
     else:
         assert isinstance(model, GlobalLVM)
-
-        ## sanity checks
-        assert (
-            model_trace.nodes["z"]["value"] == guide_trace.nodes["z"]["value"]
-        ).all()
-        assert model_trace.nodes["obs"]["value"].shape == (L, N, 1)
-        assert model_trace.nodes["obs"]["fn"].base_dist.loc.shape == (S, L, N, 1)
-        assert model_trace.nodes["obs"]["fn"].base_dist.scale.shape == (S, L, N, 1)
-        assert model_trace.nodes["obs"]["log_prob"].shape == (S, L, N)
-        assert model_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
-        assert model_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
-        assert guide_trace.nodes["z"]["value"].shape == (S, L, 1, 1)
-        assert guide_trace.nodes["z"]["log_prob"].shape == (S, L, 1)
-
-        ## compute the log importance weights for each task and sample
-        log_prob_lhd = torch.sum(
-            model_trace.nodes["obs"]["log_prob"], dim=2, keepdim=True
+        log_marg_lhd, log_iw = sampled_log_marginal_likelihood_global_lvm(
+            model=model, guide=guide, estimator_type=estimator_type, S=S, y=y
         )
-        log_prob_prior = model_trace.nodes["z"]["log_prob"]
-        log_prob_guide = guide_trace.nodes["z"]["log_prob"]
-        assert (
-            log_prob_lhd.shape
-            == log_prob_prior.shape
-            == log_prob_guide.shape
-            == (S, L, 1)
-        )
-        log_iw = log_prob_lhd + log_prob_prior - log_prob_guide
-        assert log_iw.shape == (S, L, 1)
 
-        ## compute log marginal likelihood
-        if estimator_type == "iwae_elbo":
-            log_marg_lhd = torch.logsumexp(log_iw, dim=0, keepdim=True)  # sample dim
-            log_marg_lhd = torch.sum(log_marg_lhd, dim=1, keepdim=True)  # task dim
-            assert log_marg_lhd.shape == (1, 1, 1)
-            log_marg_lhd = log_marg_lhd.squeeze()
-            log_marg_lhd = log_marg_lhd - L * torch.log(torch.tensor(S))
-        elif estimator_type == "standard_elbo":
-            log_marg_lhd = torch.sum(log_iw) / S
-        else:
-            raise NotImplementedError
-
-    return log_marg_lhd, log_iw, true_elbo
+    return log_marg_lhd, log_iw, pyro_elbo
 
 
 def true_log_marginal_likelihood(model, y):
@@ -567,11 +629,7 @@ def get_log_marginal_likelihood(model, guide, y, S, N_S, estimator_type):
     lml_sampled = torch.zeros(N_S)
     for i in range(N_S):
         lml_sampled[i], _, _ = sampled_log_marginal_likelihood(
-            model=model,
-            guide=guide,
-            y=y,
-            S=S,
-            estimator_type=estimator_type,
+            model=model, guide=guide, y=y, S=S, estimator_type=estimator_type
         )
     lml_sampled_mean = lml_sampled.mean()
     lml_sampled_std = lml_sampled.std()
@@ -586,7 +644,15 @@ def get_log_marginal_likelihood(model, guide, y, S, N_S, estimator_type):
 
 
 def optimize_prior(
-    model, guide, y, S, lml_estimator_type, n_epochs, initial_lr, final_lr, wandb_run
+    model,
+    guide,
+    y,
+    S,
+    lml_estimator_type,
+    n_epochs,
+    initial_lr,
+    final_lr,
+    wandb_run,
 ):
     # prepare return values
     losses = []
@@ -621,7 +687,7 @@ def optimize_prior(
         mu_zs.append(model.prior.mu_z.item())
         sigma_zs.append(model.prior.sigma_z.item())
         log_iws.append(log_iw.detach())
-        wandb_run.log({"epoch": epoch, "loss": loss})
+        wandb_run.log({"epoch": epoch, "loss": loss, "pyro_elbo": pyro_elbo})
         if epoch % 100 == 0 or epoch == n_epochs - 1:
             string = f"epoch = {epoch:04d}"
             string += f" | loss = {loss.item():+.4f}"
@@ -1116,9 +1182,19 @@ def run_experiment(config, wandb_run):
         mu_z_opt=mu_z_opt if config["optimize"] else None,
         sigma_z_opt=sigma_z_opt if config["optimize"] else None,
     )
+    fig.suptitle(
+        f"model={config['model_type']}, guide={config['guide_type']}, "
+        f"estimator={config['lml_estimator_type']}, S={config['S']}"
+    )
+    fig.tight_layout()
     wandb_run.log({"summary_plot": wandb.Image(fig)})
     if config["optimize"]:
         fig = plot_log_importance_weight_histograms(log_iws=log_iws)
+        fig.suptitle(
+            f"model={config['model_type']}, guide={config['guide_type']}, "
+            f"estimator={config['lml_estimator_type']}, S={config['S']}"
+        )
+        fig.tight_layout()
         wandb_run.log({"log_importance_weights_plot": wandb.Image(fig)})
 
     if wandb_run.mode == "disabled":
@@ -1126,8 +1202,6 @@ def run_experiment(config, wandb_run):
 
 
 def main():
-    # TODO: true posterior does not work anymore
-
     ## define config
     wandb_mode = os.getenv("WANDB_MODE", "disabled")
     print(f"wandb_mode={wandb_mode}")
@@ -1136,14 +1210,14 @@ def main():
     config = {
         "rng_seed": 123,
         ## data
-        "L": 25,
-        "N": 25,
+        "L": 32,
+        "N": 64,
         "mu_z_true": 1.0,
         "sigma_z_true": 0.5,
         "sigma_n_true": sigma_n_true,
         ## model
-        "model_type": "local_lvm",
-        # "model_type": "global_lvm",
+        # "model_type": "local_lvm",
+        "model_type": "global_lvm",
         "mu_z_init": -1.0,
         "sigma_z_init": 1.0,
         "sigma_n_model": sigma_n_true,
@@ -1154,12 +1228,14 @@ def main():
         # "guide_type": "approximate_posterior",
         ## log marginal likelihood estimation
         # "lml_estimator_type": "iwae_elbo",
-        "lml_estimator_type": "standard_elbo",
+        "lml_estimator_type": "iwae_elbo_local_reparametrization",
+        # "lml_estimator_type": "standard_elbo",
+        # "lml_estimator_type": "standard_elbo_local_reparametrization",
         "S": 2 ** 2,  # number of samples for log marg likelihood / gradient estimation
         "N_S": 25,  # number of sample sets for log marg likelihood estimation
         ## optimization
         "optimize": True,
-        "n_epochs": 1000,
+        "n_epochs": 5000,
         "initial_lr": 1e-2,
         "final_lr": 1e-2,
         ## plotting
