@@ -1,6 +1,6 @@
 # Multi-task Bayesian Neural Networks in Pyro 
 ## What is this?
-This is a [Pyro](https://pyro.ai) implementation of Multi-task Bayesian Neural Networks (BNNs). It allows to train BNNs on a distribution of tasks in order to distill the structure shared by the tasks in a BNN prior.
+This is a [Pyro](https://pyro.ai) implementation of Multi-task Bayesian Neural Networks (BNNs). It allows to train BNNs on a distribution of tasks in order to distill the structure shared by the tasks in a BNN prior. Note that this project is in a very early stage of development.
 
 ![](./plots/affine.png)
 ## Getting Started
