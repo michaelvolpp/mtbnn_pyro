@@ -10,11 +10,11 @@ src/mtbnn/__init__.py
 src/mtbnn/gmm.py
 src/mtbnn/mtbnn.py
 src/mtbnn/plotting.py
-src/mtbnn.egg-info/PKG-INFO
-src/mtbnn.egg-info/SOURCES.txt
-src/mtbnn.egg-info/dependency_links.txt
-src/mtbnn.egg-info/requires.txt
-src/mtbnn.egg-info/top_level.txt
+src/mtbnn_pyro.egg-info/PKG-INFO
+src/mtbnn_pyro.egg-info/SOURCES.txt
+src/mtbnn_pyro.egg-info/dependency_links.txt
+src/mtbnn_pyro.egg-info/requires.txt
+src/mtbnn_pyro.egg-info/top_level.txt
 src/mtmlp/__init__.py
 src/mtmlp/mtmlp.py
 src/mtmlp/plotting.py

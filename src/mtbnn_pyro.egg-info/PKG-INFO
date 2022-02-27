@@ -1,16 +1,15 @@
 Metadata-Version: 2.1
-Name: mtbnn
+Name: mtbnn-pyro
 Version: 0.0.1
-Summary:  An implementation of multi-task Bayesian neural networks and related models.
-Home-page: UNKNOWN
+Summary: A Pyro implementation of multi-task Bayesian neural networks and related models.
 Author: Michael Volpp
-License: tbd
+License: MIT
 Platform: linux
 Platform: osx
 Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3 :: Only
-Classifier: Programming Language :: Python :: 3.9
-Requires-Python: >=3.9
+Requires-Python: >=3.8
+Provides-Extra: dev
 License-File: LICENSE
 
 UNKNOWN

@@ -10,7 +10,7 @@ import torch
 from torch._C import dtype
 import wandb
 from matplotlib import pyplot as plt
-from metalearning_benchmarks.benchmarks.util import normalize_benchmark
+from metalearning_benchmarks.util import normalize_benchmark
 from mlp.mlp import MultiLayerPerceptron
 from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
 from mtutils.mtutils import print_headline_string as prinths
@@ -325,7 +325,7 @@ def run_experiment(
 
 def main():
     ## config
-    wandb_mode = os.getenv("WANDB_MODE", "online")
+    wandb_mode = os.getenv("WANDB_MODE", "disabled")
     smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")

@@ -8,7 +8,7 @@ import numpy as np
 import pyro
 import torch
 from metalearning_benchmarks import Affine1D, Quadratic1D, Sinusoid
-from metalearning_benchmarks.benchmarks.base_benchmark import MetaLearningBenchmark
+from metalearning_benchmarks.base_benchmark import MetaLearningBenchmark
 from scipy import integrate
 from torch import nn
 

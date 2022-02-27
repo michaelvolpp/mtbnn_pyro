@@ -199,7 +199,7 @@ def plot_predictions(
     ax = axes[0, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Mean + Meta Data")
+    ax.set_title("Prior Mean\n+ Meta Data")
     plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,
@@ -266,7 +266,7 @@ def plot_predictions(
     ax = axes[1, 0]
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Prior Observation + Meta Data")
+    ax.set_title("Prior Observation\n+ Meta Data")
     plot_predictions_for_one_set_of_tasks(
         x=x_meta,
         y=y_meta,

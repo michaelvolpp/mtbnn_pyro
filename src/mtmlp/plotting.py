@@ -72,7 +72,7 @@ def plot_predictions(
     fig, axes = plt.subplots(
         nrows=1,
         ncols=len(n_contexts_plot),
-        figsize=(16, 8),
+        figsize=(16, 5),
         sharey=True,
         squeeze=False,
     )

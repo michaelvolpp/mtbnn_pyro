@@ -13,7 +13,7 @@ import wandb
 from matplotlib import pyplot as plt
 from wandb.sdk.wandb_init import init
 from mtbnn.mtbnn import MultiTaskBayesianNeuralNetwork
-from metalearning_benchmarks.benchmarks.util import normalize_benchmark
+from metalearning_benchmarks.util import normalize_benchmark
 from mtbnn.plotting import plot_distributions, plot_metrics, plot_predictions
 from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve
 from mtutils.mtutils import print_headline_string as prinths
@@ -328,14 +328,14 @@ def main():
         n_samples_pred=1000 if not smoke_test else 100,
         # evaluation
         n_contexts_pred=(
-            [0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 128]
+            [0, 5, 10, 50, 128]
             if not smoke_test
             else [0, 5, 10, 50, 128]
         ),
         # plot
         plot=True,
         max_tasks_plot=4,
-        n_contexts_plot=[0, 5, 10, 50],
+        n_contexts_plot=[0, 5, 10, 50, 128],
     )
 
     if wandb_mode != "disabled":

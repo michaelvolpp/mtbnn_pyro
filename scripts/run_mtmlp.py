@@ -6,7 +6,7 @@ import wandb
 from matplotlib import pyplot as plt
 from mtmlp.mtmlp import MultiTaskMultiLayerPerceptron
 from mtmlp.plotting import plot_metrics, plot_predictions
-from metalearning_benchmarks.benchmarks.util import normalize_benchmark
+from metalearning_benchmarks.util import normalize_benchmark
 from mtutils.mtutils import BM_DICT, collate_data, norm_area_under_curve, split_tasks
 
 
@@ -59,9 +59,6 @@ def run_experiment(
         x_context, y_context, x_target, y_target = split_tasks(
             x=x, y=y, n_context=n_context
         )
-        # reseed to ensure the same initialization each round
-        # TODO: move this to the MLP class?
-        # torch.manual_seed(config["seed"])
         learning_curves.append(
             mlp.adapt(
                 x=x_context,
@@ -122,7 +119,7 @@ def run_experiment(
 def main():
     ## config
     wandb_mode = os.getenv("WANDB_MODE", "disabled")
-    smoke_test = os.getenv("SMOKE_TEST", "True") == "True"
+    smoke_test = os.getenv("SMOKE_TEST", "False") == "True"
     print(f"wandb_mode={wandb_mode}")
     print(f"smoke_test={smoke_test}")
     config = dict(

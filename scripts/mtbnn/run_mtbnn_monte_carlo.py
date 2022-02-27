@@ -10,7 +10,7 @@ import numpy as np
 import pyro
 import wandb
 from matplotlib import pyplot as plt
-from metalearning_benchmarks.benchmarks.util import normalize_benchmark
+from metalearning_benchmarks.util import normalize_benchmark
 from mtutils.mtutils import BM_DICT, collate_data
 from mtutils.mtutils import print_headline_string as prinths
 from mtutils.mtutils import print_pyro_parameters, summarize_samples
